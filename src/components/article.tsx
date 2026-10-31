@@ -124,6 +124,28 @@ function Article({ itemId }: ArticleProps) {
         })
     }, [dispatch, item, toggleWebpage, toggleFull, handleToggleHidden])
 
+    // "b" opens the current article externally even when focus is outside the
+    // webview. Synthetic events re-dispatched from the webview are skipped, as
+    // they are already handled by itemShortcuts above.
+    useEffect(() => {
+        const onKeyDown = (e: KeyboardEvent) => {
+            if (!e.isTrusted || e.metaKey || e.altKey) return
+            if (e.key !== "b" && e.key !== "B") return
+            const t = e.target as HTMLElement | null
+            const tag = t?.tagName
+            if (
+                t?.isContentEditable ||
+                tag === "INPUT" ||
+                tag === "TEXTAREA" ||
+                tag === "SELECT"
+            )
+                return
+            dispatch(itemShortcuts(item, e))
+        }
+        document.addEventListener("keydown", onKeyDown)
+        return () => document.removeEventListener("keydown", onKeyDown)
+    }, [dispatch, item])
+
     const updateFontSize = (size: number) => {
         window.settings.setFontSize(size)
         setFontSize(size)

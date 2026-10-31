@@ -236,6 +236,26 @@ export const Menu: React.FC = () => {
         previousDisplayRef.current = display
     }, [display])
 
+    // Let p/n move focus up/down through the visible tree items.
+    const handleTreeKeyDown = useCallback((e: React.KeyboardEvent) => {
+        if (e.ctrlKey || e.metaKey || e.altKey) return
+        const key = e.key.toLowerCase()
+        if (key !== "p" && key !== "n") return
+        const root = treeRef.current
+        if (!root) return
+        const items = Array.from(
+            root.querySelectorAll<HTMLElement>('[role="treeitem"]')
+        )
+        if (items.length === 0) return
+        const index = items.indexOf(document.activeElement as HTMLElement)
+        const next =
+            key === "n"
+                ? Math.min(index + 1, items.length - 1)
+                : Math.max(index - 1, 0)
+        e.preventDefault()
+        items[next].focus()
+    }, [])
+
     const renderSourceItem = (s: RSSSource) => {
         const key = "s-" + s.sid
         return (
@@ -312,6 +332,7 @@ export const Menu: React.FC = () => {
                             size="small"
                             appearance="subtle-alpha"
                             openItems={openItems}
+                            onKeyDown={handleTreeKeyDown}
                             onOpenChange={handleOpenChange}>
                             <MenuTreeItem
                                 value="search"
