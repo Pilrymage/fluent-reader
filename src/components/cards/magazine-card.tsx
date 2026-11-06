@@ -3,6 +3,7 @@ import { Card } from "./card"
 import CardInfo from "./info"
 import Highlights from "./highlights"
 import { SourceTextDirection } from "../../scripts/models/source"
+import { getReadTextStyle } from "../../scripts/read-style"
 
 const className = (props: Card.Props) => {
     let cn = ["card", "magazine-card"]
@@ -25,14 +26,18 @@ const MagazineCard: React.FunctionComponent<Card.Props> = props => (
         ) : null}
         <div className="data">
             <div>
-                <h3 className="title">
+                <h3
+                    className="title"
+                    style={getReadTextStyle(props.item.hasRead)}>
                     <Highlights
                         text={props.item.title}
                         filter={props.filter}
                         title
                     />
                 </h3>
-                <p className="snippet">
+                <p
+                    className="snippet"
+                    style={getReadTextStyle(props.item.hasRead)}>
                     <Highlights
                         text={props.item.snippet}
                         filter={props.filter}

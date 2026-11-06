@@ -293,12 +293,14 @@ export const minifluxServiceHooks: ServiceHooks = {
             entry_ids: [Number(item.serviceRef)],
             status: "unread",
         })
-        await fetchAPI(
+        const response = await fetchAPI(
             getState().service as MinifluxConfigs,
             "entries",
             "PUT",
             body
         )
+
+        if (response.status !== 204) throw APIError()
     },
 
     // mark entries for source ids as read, relative to date, determined by "before" bool

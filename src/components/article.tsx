@@ -34,6 +34,7 @@ import {
     closeContextMenu,
 } from "../scripts/models/app"
 import { useArticleView } from "./utils/hooks/useArticleView"
+import { isArticleOpenExternalKey } from "../scripts/keyboard"
 
 const FONT_SIZE_OPTIONS = [12, 13, 14, 15, 16, 17, 18, 19, 20]
 
@@ -116,13 +117,24 @@ function Article({ itemId }: ArticleProps) {
                         repeat: input.isAutoRepeat,
                         bubbles: true,
                     })
-                    dispatch(itemShortcuts(item, event))
+                    dispatch(itemShortcuts(item, event, "article"))
                     document.dispatchEvent(event)
                     break
                 }
             }
         })
     }, [dispatch, item, toggleWebpage, toggleFull, handleToggleHidden])
+
+    // `b` also works while focus is on the article's toolbar. Menus opened
+    // from it render in portals, so only keys from inside the article count.
+    const handleArticleKeyDown = useCallback(
+        (e: React.KeyboardEvent<HTMLElement>) => {
+            if (!e.currentTarget.contains(e.target as Node)) return
+            if (!isArticleOpenExternalKey(e.nativeEvent)) return
+            dispatch(itemShortcuts(item, e.nativeEvent, "article"))
+        },
+        [dispatch, item]
+    )
 
     const updateFontSize = (size: number) => {
         window.settings.setFontSize(size)
@@ -269,7 +281,7 @@ function Article({ itemId }: ArticleProps) {
     }
 
     return (
-        <FocusZone className="article">
+        <FocusZone className="article" onKeyDown={handleArticleKeyDown}>
             <Stack horizontal style={{ height: 36 }}>
                 <span style={{ width: 96 }}></span>
                 <Stack

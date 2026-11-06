@@ -1,5 +1,5 @@
-appId: me.hyliu.fluentreader
-productName: Fluent Reader
+appId: io.github.pilrymage.fluent-reader-custom
+productName: Fluent Reader Custom
 copyright: Copyright © 2020 Haoyuan Liu
 files:
     - "./dist/**/*"
@@ -79,7 +79,7 @@ nsis:
     oneClick: false
     perMachine: true
     allowToChangeInstallationDirectory: true
-    deleteAppDataOnUninstall: true
+    deleteAppDataOnUninstall: false
 linux:
     target:
         - AppImage

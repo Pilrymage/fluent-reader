@@ -218,6 +218,28 @@
         "fetchUnlimited": "Unlimited (not recommended)",
         "exportToLite": "Export to Fluent Reader Lite"
     },
+    "network": {
+        "tab": "Network",
+        "mode": "Connection mode",
+        "modeSystem": "System default",
+        "modeDirect": "Direct connection",
+        "modePac": "PAC script",
+        "defaultRoute": "Default session route",
+        "sandboxRoute": "Sandbox session route",
+        "verbose": "Verbose diagnostics",
+        "diagnostics": "Network diagnostics",
+        "export": "Export diagnostics",
+        "clear": "Clear diagnostics",
+        "exported": "Diagnostics exported.",
+        "exportCanceled": "Export canceled.",
+        "cleared": "Diagnostics cleared.",
+        "unavailable": "Network diagnostics are unavailable.",
+        "diagnose": "Diagnose current endpoint",
+        "diagnosing": "Diagnosing...",
+        "noCredentials": "Enter the endpoint and credentials first.",
+        "result": "Status: {status}; result: {kind}; {duration} ms; route: {route}",
+        "authCause": "Authentication failed: {cause}"
+    },
     "app": {
         "cleanup": "Clean up",
         "cache": "Clear cache",

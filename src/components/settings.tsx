@@ -10,6 +10,7 @@ import GroupsTab from "./settings/groups"
 import AppTabContainer from "../containers/settings/app-container"
 import RulesTab from "./settings/rules"
 import ServiceTabContainer from "../containers/settings/service-container"
+import NetworkTab from "./settings/network"
 import { initTouchBarWithTexts } from "../scripts/utils"
 import { useAppSelector, useAppDispatch } from "../scripts/reducer"
 import { exitSettings } from "../scripts/models/app"
@@ -105,6 +106,11 @@ const Settings: React.FC = () => {
                             headerText={intl.get("settings.service")}
                             itemIcon="CloudImportExport">
                             <ServiceTabContainer />
+                        </PivotItem>
+                        <PivotItem
+                            headerText={intl.get("network.tab")}
+                            itemIcon="Globe">
+                            <NetworkTab />
                         </PivotItem>
                         <PivotItem
                             headerText={intl.get("settings.app")}

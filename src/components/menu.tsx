@@ -36,6 +36,7 @@ import { useIsWideScreen } from "./utils/hooks/useIsWideScreen"
 import { useIsBlurred } from "./utils/hooks/useIsBlurred"
 import { Icon } from "@fluentui/react"
 import { StackShim } from "@fluentui/react-migration-v8-v9"
+import { getTreeNavigationStep, pickAdjacentElement } from "../scripts/keyboard"
 
 const useMenuClasses = makeStyles({
     menuBtn: {
@@ -236,6 +237,25 @@ export const Menu: React.FC = () => {
         previousDisplayRef.current = display
     }, [display])
 
+    // p/n move like ArrowUp/ArrowDown. This runs in the capture phase so it
+    // can cancel the tree's type-ahead, which would otherwise jump to the next
+    // item whose name starts with p or n. Collapsed groups unmount their
+    // children, so the rendered tree items are exactly the visible ones.
+    const handleTreeKeyDownCapture = useCallback(
+        (e: React.KeyboardEvent<HTMLElement>) => {
+            const step = getTreeNavigationStep(e.nativeEvent)
+            if (step === null || !treeRef.current) return
+            e.preventDefault()
+            const items = Array.from(
+                treeRef.current.querySelectorAll<HTMLElement>(
+                    '[role="treeitem"]'
+                )
+            )
+            pickAdjacentElement(items, e.target as HTMLElement, step)?.focus()
+        },
+        []
+    )
+
     const renderSourceItem = (s: RSSSource) => {
         const key = "s-" + s.sid
         return (
@@ -312,7 +332,8 @@ export const Menu: React.FC = () => {
                             size="small"
                             appearance="subtle-alpha"
                             openItems={openItems}
-                            onOpenChange={handleOpenChange}>
+                            onOpenChange={handleOpenChange}
+                            onKeyDownCapture={handleTreeKeyDownCapture}>
                             <MenuTreeItem
                                 value="search"
                                 label={intl.get("search")}

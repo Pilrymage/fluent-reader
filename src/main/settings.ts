@@ -12,9 +12,10 @@ import {
     StoredRule,
     getRuleTargetKey,
 } from "../schema-types"
-import { ipcMain, session, nativeTheme, app } from "electron"
+import { ipcMain, nativeTheme, app } from "electron"
 import { WindowManager } from "./window"
 import { transformLovefieldRules } from "./utils"
+import { applyProxyMode, getProxyMode } from "./network"
 
 export const store = new Store<SchemaTypes>()
 
@@ -83,9 +84,16 @@ const PAC_STATUS_KEY = "pacOn"
 function getProxyStatus() {
     return store.get(PAC_STATUS_KEY, false)
 }
+function applyEffectiveProxy() {
+    applyProxyMode(getProxyMode(store), { getStore: () => store }).catch(
+        () => {}
+    )
+}
 function toggleProxyStatus() {
-    store.set(PAC_STATUS_KEY, !getProxyStatus())
-    setProxy()
+    const enabled = !getProxyStatus()
+    store.set(PAC_STATUS_KEY, enabled)
+    store.set("proxyMode", enabled ? "pac" : "system")
+    applyEffectiveProxy()
 }
 function getProxy() {
     return store.get(PAC_STORE_KEY, "")
@@ -96,11 +104,7 @@ function setProxy(address = null) {
     } else {
         store.set(PAC_STORE_KEY, address)
     }
-    if (getProxyStatus()) {
-        let rules = { pacScript: address }
-        session.defaultSession.setProxy(rules)
-        session.fromPartition("sandbox").setProxy(rules)
-    }
+    applyEffectiveProxy()
 }
 ipcMain.on("get-proxy-status", event => {
     event.returnValue = getProxyStatus()

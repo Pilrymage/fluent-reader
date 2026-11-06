@@ -68,6 +68,8 @@ export interface ServiceConfigs {
     importGroups?: boolean
 }
 
+export type ProxyMode = "system" | "direct" | "pac"
+
 export const enum WindowStateListenerType {
     Maximized,
     Focused,
@@ -128,4 +130,6 @@ export type SchemaTypes = {
     menuUnreadSourcesOnly: boolean
     sourceRules: StoredRules
     dbVersion: string
+    proxyMode?: ProxyMode
+    networkDiagVerbose?: boolean
 }

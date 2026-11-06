@@ -60,5 +60,11 @@ export namespace Card {
 
     const onKeyDown = (props: Props, e: React.KeyboardEvent) => {
         props.shortcuts(props.item, e.nativeEvent)
+        // Native cancellation alone does not update React's synthetic flags.
+        // Keep the parent FocusZone from processing a handled arrow a second time.
+        if (e.nativeEvent.defaultPrevented) {
+            e.preventDefault()
+            e.stopPropagation()
+        }
     }
 }

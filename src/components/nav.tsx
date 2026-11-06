@@ -1,11 +1,17 @@
 import * as React from "react"
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import intl from "react-intl-universal"
 import { useSelector, useDispatch } from "react-redux"
 import { Icon } from "@fluentui/react/lib/Icon"
 import { IObjectWithKey } from "@fluentui/react"
 import { RootState } from "../scripts/reducer"
-import { fetchItems, markAllRead } from "../scripts/models/item"
+import {
+    fetchItems,
+    markAllRead,
+    cancelPendingMarkRead,
+    noteCardFocus,
+    resetItemShortcutState,
+} from "../scripts/models/item"
 import {
     makeStyles,
     mergeClasses,
@@ -20,6 +26,11 @@ import {
 } from "../scripts/models/app"
 import { toggleSearch } from "../scripts/models/page"
 import { ViewType, WindowStateListenerType } from "../schema-types"
+import {
+    getGlobalShortcutAction,
+    HeldKeyTracker,
+    resetPositionCycle,
+} from "../scripts/keyboard"
 import { FlatButton } from "./utils/FlatButton"
 import { FlatButtonGroup } from "./utils/FlatButtonGroup"
 import { FlatButtonSeparator } from "./utils/FlatButtonSeparator"
@@ -128,7 +139,17 @@ const Nav: React.FC = () => {
     const search = useCallback(() => dispatch(toggleSearch()), [dispatch])
     const settings = useCallback(() => dispatch(toggleSettings()), [dispatch])
     const markAll = useCallback(() => dispatch(openMarkAllMenu()), [dispatch])
-    const markAllDirect = useCallback(() => dispatch(markAllRead()), [dispatch])
+    const feedSids = useSelector(
+        (state: RootState) => state.feeds[state.page.feedId]?.sids
+    )
+    const feedId = useSelector((state: RootState) => state.page.feedId)
+    // Capture the category's sources when the key fires so a late completion
+    // can never mark a different category the user switched to.
+    const markAllDirect = useCallback(
+        () => dispatch(markAllRead(feedSids ? [...feedSids] : null)),
+        [dispatch, feedSids]
+    )
+    const heldMarkAll = useRef(new HeldKeyTracker())
     const views = useCallback(() => {
         if (state.contextMenu.event !== "#view-toggle") {
             dispatch(openViewMenu())
@@ -161,10 +182,23 @@ const Nav: React.FC = () => {
                         if (!itemShown) settings()
                         break
                 }
+                if (
+                    getGlobalShortcutAction(
+                        e as KeyboardEvent,
+                        state,
+                        document.activeElement
+                    ) === "markAllRead"
+                ) {
+                    if (!heldMarkAll.current.has(e)) {
+                        heldMarkAll.current.add(e)
+                        markAllDirect()
+                    }
+                }
             }
         },
         [
             state.settings.display,
+            state.contextMenu.type,
             itemShown,
             menu,
             search,
@@ -184,6 +218,60 @@ const Nav: React.FC = () => {
             // Cleanup will be handled by the event listener removal effect
         }
     }, [setBodyFullscreenState, windowStateListener])
+
+    useEffect(() => {
+        const releaseHeldKey = (e: KeyboardEvent) => {
+            heldMarkAll.current.delete(e)
+            // Releasing r stops a backlog of queued mark-read steps.
+            if (e && (e.key === "r" || e.key === "R" || e.code === "KeyR")) {
+                cancelPendingMarkRead()
+            }
+        }
+        const clearHeldKeys = () => {
+            heldMarkAll.current.clear()
+            cancelPendingMarkRead()
+        }
+        document.addEventListener("keyup", releaseHeldKey)
+        window.addEventListener("blur", clearHeldKeys)
+        return () => {
+            document.removeEventListener("keyup", releaseHeldKey)
+            window.removeEventListener("blur", clearHeldKeys)
+        }
+    }, [])
+
+    useEffect(() => {
+        const resetCycle = () => resetPositionCycle()
+        document.addEventListener("mousedown", resetCycle)
+        return () => {
+            document.removeEventListener("mousedown", resetCycle)
+        }
+    }, [])
+
+    useEffect(() => {
+        // Moving focus to a different row (mouse, Tab, programmatic) restarts
+        // the Ctrl+L position cycle for that row.
+        const onFocusIn = (e: FocusEvent) => {
+            const target = e.target as HTMLElement
+            if (!target || typeof target.closest !== "function") return
+            const card = target.closest(
+                ".list-card, .compact-card, .magazine-card, .default-card"
+            )
+            if (!card || typeof (card as HTMLElement).getAttribute !== "function")
+                return
+            const raw = (card as HTMLElement).getAttribute("data-iid")
+            if (!raw) return
+            noteCardFocus(Number(raw))
+        }
+        document.addEventListener("focusin", onFocusIn)
+        return () => {
+            document.removeEventListener("focusin", onFocusIn)
+        }
+    }, [])
+
+    useEffect(() => {
+        // A category switch must not carry focus, cycle position or backlog.
+        resetItemShortcutState()
+    }, [feedId])
 
     useEffect(() => {
         document.addEventListener("keydown", navShortcutsHandler)

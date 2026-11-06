@@ -8,3 +8,8 @@ bin/*
 .DS_Store
 *.provisionprofile
 *.lock
+/tests/custom-e2e/profile/
+/tests/custom-e2e/__pycache__/
+/tests/custom-e2e/*-results.json
+/tests/custom-e2e/*.log
+logs/

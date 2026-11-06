@@ -1,9 +1,12 @@
-import { app, Menu, nativeTheme } from "electron"
+import "./custom-runtime"
+import { app, Menu, nativeTheme, dialog } from "electron"
 import { ThemeSettings } from "./schema-types"
 import { store } from "./main/settings"
 import performUpdate from "./main/update-scripts"
 import { WindowManager } from "./main/window"
 import { initDB } from "./main/db"
+import { registerNetworkIpc } from "./main/network"
+import { registerDiagnosticsIpc } from "./main/diagnostics"
 
 if (!process.mas) {
     const locked = app.requestSingleInstanceLock()
@@ -14,13 +17,22 @@ if (!process.mas) {
 
 if (!app.isPackaged) app.setAppUserModelId(process.execPath)
 else if (process.platform === "win32")
-    app.setAppUserModelId("me.hyliu.fluentreader")
+    app.setAppUserModelId("io.github.pilrymage.fluent-reader-custom")
 
 let restarting = false
 
 function init() {
     performUpdate(store)
     nativeTheme.themeSource = store.get("theme", ThemeSettings.Default)
+    registerNetworkIpc({ getStore: () => store })
+    registerDiagnosticsIpc({
+        getStore: () => store,
+        userData: () => app.getPath("userData"),
+        dialog: {
+            showSaveDialog: (options?: unknown) =>
+                dialog.showSaveDialog(options as Electron.SaveDialogOptions),
+        },
+    })
 }
 
 init()

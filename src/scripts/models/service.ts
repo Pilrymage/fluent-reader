@@ -20,6 +20,7 @@ import { feedbinServiceHooks } from "./services/feedbin"
 import { gReaderServiceHooks } from "./services/greader"
 import { minifluxServiceHooks } from "./services/miniflux"
 import { nextcloudServiceHooks } from "./services/nextcloud"
+import { pendingReadStates } from "./services/pending-read-states"
 
 export interface ServiceHooks {
     authenticate?: (configs: ServiceConfigs) => Promise<boolean>
@@ -59,6 +60,75 @@ export function getServiceHooksFromType(type: SyncService): ServiceHooks {
 export function getServiceHooks(): AppThunk<ServiceHooks> {
     return (_, getState) => {
         return getServiceHooksFromType(getState().service.type)
+    }
+}
+
+const readStateChains = new Map<string, Promise<boolean>>()
+const RETRY_BATCH_SIZE = 8
+const MAX_RETRIES_PER_SYNC = 200
+
+// Sends a local read/unread change to the service. The change stays pending,
+// and is protected from being reverted by a sync, until the service accepts it.
+export function pushReadState(
+    item: RSSItem,
+    read: boolean
+): AppThunk<Promise<boolean>> {
+    return (dispatch, getState) => {
+        const ref = item.serviceRef
+        if (!ref) return Promise.resolve(true)
+        pendingReadStates.use(getState().service).set([ref], read)
+        return dispatch(sendReadState(ref))
+    }
+}
+
+// Requests for one item run in order, and each sends the latest local state.
+// Resolves false when the service did not accept it.
+function sendReadState(ref: string): AppThunk<Promise<boolean>> {
+    return (dispatch, getState) => {
+        const previous = readStateChains.get(ref) || Promise.resolve(true)
+        const next = previous.then(async () => {
+            const configs = getState().service
+            const pending = pendingReadStates.use(configs)
+            const read = pending.get(ref)
+            if (read === undefined) return true
+            const hooks = getServiceHooksFromType(configs.type)
+            const hook = read ? hooks.markRead : hooks.markUnread
+            if (hook) {
+                try {
+                    // Service hooks only read the serviceRef of the item.
+                    await dispatch(hook({ serviceRef: ref } as RSSItem))
+                } catch (err) {
+                    console.log(err)
+                    return false
+                }
+            }
+            pending.confirm(ref, read)
+            return true
+        })
+        readStateChains.set(ref, next)
+        void next.then(() => {
+            if (readStateChains.get(ref) === next) readStateChains.delete(ref)
+        })
+        return pendingReadStates.track(next)
+    }
+}
+
+// Lets requests on the wire land and retries the ones that failed, so the
+// unread list fetched next already includes them.
+function flushReadStates(): AppThunk<Promise<void>> {
+    return async (dispatch, getState) => {
+        const pending = pendingReadStates.use(getState().service)
+        await pending.settled()
+        const refs = pending.refs().slice(0, MAX_RETRIES_PER_SYNC)
+        for (let i = 0; i < refs.length; i += RETRY_BATCH_SIZE) {
+            const results = await Promise.all(
+                refs
+                    .slice(i, i + RETRY_BATCH_SIZE)
+                    .map(ref => dispatch(sendReadState(ref)))
+            )
+            // Stop once nothing gets through; the rest stays protected.
+            if (!results.some(Boolean)) break
+        }
     }
 }
 
@@ -121,6 +191,13 @@ function updateSources(
             if (existing.has(s.serviceRef)) {
                 const doc = existing.get(s.serviceRef)
                 existing.delete(s.serviceRef)
+                const hasIncomingIcon =
+                    typeof s.iconurl === "string" && s.iconurl.trim() !== ""
+                if (hasIncomingIcon && s.iconurl !== doc.iconurl) {
+                    const updated = { ...doc, iconurl: s.iconurl }
+                    await dispatch(updateSource(updated))
+                    return updated
+                }
                 return doc
             } else {
                 const docs = (await database
@@ -136,7 +213,8 @@ function updateSources(
                     inserted.unreadCount = 0
                     dispatch(addSourceSuccess(inserted, true))
                     window.settings.saveGroups(getState().groups)
-                    dispatch(updateFavicon([inserted.sid]))
+                    if (inserted.iconurl === undefined)
+                        dispatch(updateFavicon([inserted.sid]))
                     return inserted
                 } else if (docs[0].serviceRef !== s.serviceRef) {
                     // Mark an existing source as remote and remove all items
@@ -180,8 +258,10 @@ function updateSources(
 
 function syncItems(hook: ServiceHooks["syncItems"]): AppThunk<Promise<void>> {
     return async (dispatch, getState) => {
-        const state = getState()
+        await dispatch(flushReadStates())
         const [unreadRefs, starredRefs] = await dispatch(hook())
+        // Local changes the service has not confirmed win over its list.
+        pendingReadStates.use(getState().service).applyTo(unreadRefs)
         const unreadCopy = new Set(unreadRefs)
         const starredCopy = new Set(starredRefs)
         const rows = await database

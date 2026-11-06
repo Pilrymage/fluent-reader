@@ -4,9 +4,11 @@ import CardInfo from "./info"
 import Time from "../utils/time"
 import Highlights from "./highlights"
 import { SourceTextDirection } from "../../scripts/models/source"
+import { getReadTextStyle } from "../../scripts/read-style"
 
 const className = (props: Card.Props) => {
     let cn = ["card", "compact-card"]
+    if (props.item.hasRead) cn.push("read")
     if (props.item.hidden) cn.push("hidden")
     if (props.source.textDir === SourceTextDirection.RTL) cn.push("rtl")
     return cn.join(" ")
@@ -20,14 +22,18 @@ const CompactCard: React.FunctionComponent<Card.Props> = props => (
         data-is-focusable>
         <CardInfo source={props.source} item={props.item} hideTime />
         <div className="data">
-            <span className="title">
+            <span
+                className="title"
+                style={getReadTextStyle(props.item.hasRead)}>
                 <Highlights
                     text={props.item.title}
                     filter={props.filter}
                     title
                 />
             </span>
-            <span className="snippet">
+            <span
+                className="snippet"
+                style={getReadTextStyle(props.item.hasRead)}>
                 <Highlights text={props.item.snippet} filter={props.filter} />
             </span>
         </div>

@@ -1,7 +1,10 @@
 import windowStateKeeper from "electron-window-state"
 import { BrowserWindow, nativeTheme, app } from "electron"
 import * as path from "node:path"
-import { setThemeListener } from "./settings"
+import { setThemeListener, store } from "./settings"
+import { applyProxyMode, getProxyMode } from "./network"
+import { appendDiagnostic } from "./diagnostics"
+import { extractErrorCode } from "../scripts/models/net/diagnostics"
 import { setUtilsListeners } from "./utils"
 
 export class WindowManager {
@@ -13,7 +16,16 @@ export class WindowManager {
     }
 
     private init = () => {
-        app.on("ready", () => {
+        app.on("ready", async () => {
+            // Apply the persisted route before creating a renderer (including
+            // preload IPC). Renderer startup alone was racy for first requests.
+            try {
+                await applyProxyMode(getProxyMode(store), { getStore: () => store })
+            } catch (err) {
+                try {
+                    appendDiagnostic({ ts: Date.now(), phase: "proxy-startup", outcome: "error", errorKind: "network", errorCode: extractErrorCode(err) })
+                } catch { /* Show settings even if diagnostics cannot be written. */ }
+            }
             this.mainWindowState = windowStateKeeper({
                 defaultWidth: 1200,
                 defaultHeight: 700,

@@ -2,8 +2,22 @@ import * as React from "react"
 import intl from "react-intl-universal"
 import md5 from "js-md5"
 import { ServiceConfigsTabProps } from "../service"
-import { FeverConfigs } from "../../../scripts/models/services/fever"
+import {
+    FeverConfigs,
+    getLastFeverAuthFailure,
+} from "../../../scripts/models/services/fever"
 import { SyncService } from "../../../schema-types"
+
+interface EndpointDiagnosis {
+    ok: boolean
+    status?: number
+    auth?: number
+    errorKind?: string
+    cause?: string
+    durationMs: number
+    endpoint: string
+    proxyRoute: string
+}
 import {
     Stack,
     Icon,
@@ -28,6 +42,9 @@ type FeverConfigsTabState = {
     password: string
     fetchLimit: number
     importGroups: boolean
+    diagnosing: boolean
+    diagnosis: EndpointDiagnosis
+    authCause: string
 }
 
 class FeverConfigsTab extends React.Component<
@@ -44,6 +61,49 @@ class FeverConfigsTab extends React.Component<
             password: "",
             fetchLimit: configs.fetchLimit || 250,
             importGroups: true,
+            diagnosing: false,
+            diagnosis: null,
+            authCause: "",
+        }
+    }
+
+    diagnose = async () => {
+        const bridge = window.network
+        if (!bridge) return
+        const endpoint = this.state.endpoint.trim()
+        const stored = this.props.configs as FeverConfigs
+        let apiKey: string
+        if (this.state.password) {
+            apiKey = md5(`${this.state.username}:${this.state.password}`)
+        } else if (this.state.existing) {
+            apiKey = stored.apiKey
+        }
+        if (!endpoint || !apiKey) {
+            this.setState({
+                authCause: intl.get("network.noCredentials"),
+            })
+            return
+        }
+        this.setState({ diagnosing: true, diagnosis: null, authCause: "" })
+        try {
+            const diagnosis = await bridge.diagnoseEndpoint({
+                endpoint,
+                apiKey,
+                username: this.state.username,
+            })
+            this.setState({
+                diagnosing: false,
+                diagnosis,
+                authCause:
+                    !diagnosis.ok && diagnosis.errorKind === "auth"
+                        ? diagnosis.cause || ""
+                        : "",
+            })
+        } catch {
+            this.setState({
+                diagnosing: false,
+                authCause: intl.get("network.unavailable"),
+            })
         }
     }
 
@@ -65,7 +125,7 @@ class FeverConfigsTab extends React.Component<
     handleInputChange = event => {
         const name: string = event.target.name
         // @ts-expect-error
-        this.setState({ [name]: event.target.value })
+        this.setState({ [name]: event.target.value, diagnosis: null, authCause: "" })
     }
 
     checkNotEmpty = (v: string) => {
@@ -112,6 +172,11 @@ class FeverConfigsTab extends React.Component<
             this.props.sync()
         } else {
             this.props.blockActions()
+            this.setState({
+                authCause:
+                    getLastFeverAuthFailure() ||
+                    intl.get("service.failureHint"),
+            })
             window.utils.showErrorBox(
                 intl.get("service.failure"),
                 intl.get("service.failureHint")
@@ -215,6 +280,51 @@ class FeverConfigsTab extends React.Component<
                                 this.setState({ importGroups: c })
                             }
                         />
+                    )}
+                    <Stack horizontal style={{ marginTop: 16 }}>
+                        <Stack.Item>
+                            <DefaultButton
+                                text={
+                                    this.state.diagnosing
+                                        ? intl.get("network.diagnosing")
+                                        : intl.get("network.diagnose")
+                                }
+                                onClick={this.diagnose}
+                                disabled={this.state.diagnosing}
+                            />
+                        </Stack.Item>
+                    </Stack>
+                    {this.state.diagnosis && (
+                        <MessageBar
+                            messageBarType={
+                                this.state.diagnosis.ok
+                                    ? MessageBarType.success
+                                    : MessageBarType.error
+                            }>
+                            {intl.get("network.result", {
+                                status: this.state.diagnosis.status ?? "-",
+                                kind: this.state.diagnosis.ok
+                                    ? "ok"
+                                    : this.state.diagnosis.errorKind ||
+                                      "unknown",
+                                duration: this.state.diagnosis.durationMs,
+                                route: this.state.diagnosis.proxyRoute || "-",
+                            })}
+                            {this.state.diagnosis.cause ? " " + this.state.diagnosis.cause : ""}
+                            {this.state.authCause
+                                ? " " +
+                                  intl.get("network.authCause", {
+                                      cause: this.state.authCause,
+                                  })
+                                : ""}
+                        </MessageBar>
+                    )}
+                    {!this.state.diagnosis && this.state.authCause && (
+                        <MessageBar messageBarType={MessageBarType.error}>
+                            {intl.get("network.authCause", {
+                                cause: this.state.authCause,
+                            })}
+                        </MessageBar>
                     )}
                     <Stack horizontal style={{ marginTop: 32 }}>
                         <Stack.Item>

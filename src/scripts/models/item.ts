@@ -12,7 +12,33 @@ import {
     platformCtrl,
 } from "../utils"
 import { RSSSource, updateSource, updateUnreadCounts } from "./source"
-import { FeedActionTypes, INIT_FEED, LOAD_MORE, dismissItems } from "./feed"
+import {
+    getCardShortcutAction,
+    getNextItemId,
+    pickNextAfterRemoval,
+    planMarkReadStep,
+    navigationStillValid,
+    isComposingEvent,
+    isEditableTarget,
+    isOverlayOpen,
+    isWebviewActive,
+    StepQueue,
+    focusPositionCycle,
+    resetPositionCycle,
+    computeDirectionalScrollTop,
+    computeCycleScrollTop,
+    measureVisibleTopInset,
+    ScrollMode,
+    FocusPosition,
+    ShortcutAppState,
+} from "../keyboard"
+import {
+    FeedActionTypes,
+    INIT_FEED,
+    LOAD_MORE,
+    dismissItems,
+    loadMore,
+} from "./feed"
 import {
     pushNotification,
     setupAutoFetch,
@@ -21,6 +47,7 @@ import {
 } from "./app"
 import {
     getServiceHooks,
+    pushReadState,
     syncWithService,
     ServiceActionTypes,
     SYNC_LOCAL_ITEMS,
@@ -349,9 +376,7 @@ export function markRead(item: RSSItem): AppThunk<Promise<void>> {
                 .set({ hasRead: true })
                 .where(eq(itemsTable._id, item._id))
             dispatch(markReadDone(item))
-            if (item.serviceRef) {
-                dispatch(dispatch(getServiceHooks()).markRead?.(item))
-            }
+            if (item.serviceRef) dispatch(pushReadState(item, true))
         }
     }
 }
@@ -413,9 +438,7 @@ export function markUnread(item: RSSItem): AppThunk<Promise<void>> {
                 .set({ hasRead: false })
                 .where(eq(itemsTable._id, item._id))
             dispatch(markUnreadDone(item))
-            if (item.serviceRef) {
-                dispatch(dispatch(getServiceHooks()).markUnread?.(item))
-            }
+            if (item.serviceRef) dispatch(pushReadState(item, false))
         }
     }
 }
@@ -455,9 +478,376 @@ export function toggleHidden(item: RSSItem): AppThunk<Promise<void>> {
     }
 }
 
-export function itemShortcuts(item: RSSItem, e: KeyboardEvent): AppThunk {
-    return dispatch => {
+const FOCUS_RETRY_TIMEOUT = 1200
+const FOCUS_RETRY_INTERVAL = 50
+
+let keyboardFocusId: number | null = null
+let lastFeedId: string | number | null = null
+let focusGeneration = 0
+const markReadQueue = new StepQueue()
+
+type FocusScrollIntent = { mode: ScrollMode } | { position: FocusPosition }
+
+type ShortcutState = {
+    page?: { feedId?: string | number; itemId?: number | null; viewType?: number }
+    feeds?: any
+    app?: ShortcutAppState
+}
+
+function scheduleFocusAttempt(attempt: () => void) {
+    if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(attempt)
+    } else if (typeof setTimeout === "function") {
+        setTimeout(attempt, FOCUS_RETRY_INTERVAL)
+    }
+}
+
+function getActiveCardId(): number | null {
+    if (typeof document === "undefined" || !document.activeElement) return null
+    const el = document.activeElement as HTMLElement
+    if (typeof el.getAttribute !== "function") return null
+    const raw = el.getAttribute("data-iid")
+    if (!raw) return null
+    const id = Number(raw)
+    return Number.isFinite(id) ? id : null
+}
+
+function getScrollContainer(): HTMLElement | null {
+    if (typeof document === "undefined" || !document.getElementById) {
+        return null
+    }
+    return document.getElementById("refocus")
+}
+
+function getNavBottom(containerTop: number): number {
+    if (typeof document === "undefined" || !document.querySelector) {
+        return containerTop
+    }
+    const nav = document.querySelector("nav") as HTMLElement | null
+    if (!nav || typeof nav.getBoundingClientRect !== "function") {
+        return containerTop
+    }
+    const rect = nav.getBoundingClientRect()
+    return Number.isFinite(rect.bottom) ? rect.bottom : containerTop
+}
+
+function scrollCardIntoPlace(target: HTMLElement, intent: FocusScrollIntent) {
+    const container = getScrollContainer()
+    if (!container || !intent) return
+    const cardRect = target.getBoundingClientRect()
+    const containerRect = container.getBoundingClientRect()
+    const cardTop = cardRect.top - containerRect.top + container.scrollTop
+    const cardHeight = cardRect.height || target.offsetHeight || 0
+    const topInset = measureVisibleTopInset(
+        containerRect.top,
+        getNavBottom(containerRect.top),
+        container.clientHeight
+    )
+    const maxScrollTop = Math.max(
+        0,
+        container.scrollHeight - container.clientHeight
+    )
+    const nextTop =
+        "position" in intent
+            ? computeCycleScrollTop(
+                  intent.position,
+                  cardTop,
+                  cardHeight,
+                  container.scrollTop,
+                  container.clientHeight,
+                  topInset,
+                  maxScrollTop
+              )
+            : computeDirectionalScrollTop(
+                  cardTop,
+                  cardHeight,
+                  container.scrollTop,
+                  container.clientHeight,
+                  topInset,
+                  maxScrollTop,
+                  intent.mode
+              )
+    container.scrollTop = nextTop
+}
+
+function isFocusContextActive(
+    getState: () => any,
+    feedId: string | number,
+    id: number
+): boolean {
+    const state: ShortcutState = getState()
+    if (!state || !state.page) return false
+    if (state.page.feedId !== feedId) return false
+    if (isOverlayOpen(state.app as ShortcutAppState)) return false
+    const feed = state.feeds ? state.feeds[feedId] : null
+    if (!feed || !Array.isArray(feed.iids) || !feed.iids.includes(id)) {
+        return false
+    }
+    return true
+}
+
+function focusCardWhenReady(
+    getState: () => any,
+    id: number,
+    intent?: FocusScrollIntent
+) {
+    if (typeof document === "undefined" || !document.querySelector) return
+    const state: ShortcutState = getState()
+    if (!state || !state.page) return
+    const feedId = state.page.feedId
+    const token = ++focusGeneration
+    const selector = `[data-iid="${id}"]`
+    const deadline = Date.now() + FOCUS_RETRY_TIMEOUT
+    const findCard = () =>
+        document.querySelector(selector) as HTMLElement | null
+
+    const attempt = () => {
+        if (token !== focusGeneration) return
+        if (!isFocusContextActive(getState, feedId, id)) return
+        const target = findCard()
+        if (target) {
+            // FocusZone assigns tabindex only after it observes a card. Newly
+            // appended virtualized cards have none yet, and focus() is a no-op
+            // without it.
+            if (!target.hasAttribute("tabindex")) {
+                target.setAttribute("tabindex", "-1")
+            }
+            scrollCardIntoPlace(target, intent)
+            try {
+                target.focus({ preventScroll: true })
+            } catch {
+                target.focus()
+            }
+            return
+        }
+        if (Date.now() >= deadline) return
+        scheduleFocusAttempt(attempt)
+    }
+
+    attempt()
+}
+
+export function cancelPendingMarkRead(): void {
+    markReadQueue.cancelPending()
+}
+
+export function resetItemShortcutState(): void {
+    markReadQueue.cancelPending()
+    keyboardFocusId = null
+    resetPositionCycle()
+}
+
+export function noteCardFocus(id: number | null): void {
+    if (id === null || !Number.isFinite(id)) return
+    // Programmatic focus sets keyboardFocusId before focusing, so this only
+    // resets when the user moved focus to a different row.
+    if (keyboardFocusId !== id) resetPositionCycle()
+}
+
+export function whenMarkReadQueueIdle(): Promise<void> {
+    return markReadQueue.whenIdle()
+}
+
+function enqueueMarkReadAndNext(
+    dispatch,
+    getState,
+    item: RSSItem,
+    repeat: boolean
+) {
+    const startFeedId = getState().page.feedId
+    // Each physical keydown targets one row. A non-repeat press re-anchors on
+    // the card that fired the event; repeats keep following keyboardFocusId.
+    if (!repeat || keyboardFocusId === null) keyboardFocusId = item._id
+    markReadQueue.enqueue(async () => {
+        const state = getState()
+        if (!navigationStillValid(startFeedId, state.page.feedId)) return
+        const currentId = keyboardFocusId
+        if (currentId === null) return
+        const feed = state.feeds[startFeedId]
+        const currentItem = state.items[currentId] || item
+        if (!feed || !currentItem) return
+        const order = [...feed.iids]
+        const step = planMarkReadStep(order, currentItem._id, feed.allLoaded)
+        const nextId = step.nextId
+        const needLoadMore = step.loadMore
+        // Mark read is never a toggle: an already-read row stays read.
+        await dispatch(markRead(currentItem))
+        if (!navigationStillValid(startFeedId, getState().page.feedId)) return
+        if (nextId !== null) {
+            keyboardFocusId = nextId
+            focusCardWhenReady(getState, nextId, { mode: "down" })
+            return
+        }
+        if (!needLoadMore) return
+        try {
+            await dispatch(loadMore(feed))
+        } catch {
+            return
+        }
+        if (!navigationStillValid(startFeedId, getState().page.feedId)) return
+        const nextFeed = getState().feeds[startFeedId]
+        if (!nextFeed) return
+        // Under an unread filter the just-read anchor disappears from iids, so
+        // follow the surviving suffix / newly appended rows instead.
+        const anchorPreserved = nextFeed.iids.includes(currentItem._id)
+        const loadedNextId = anchorPreserved
+            ? getNextItemId(nextFeed.iids, currentItem._id)
+            : pickNextAfterRemoval(order, nextFeed.iids, currentItem._id)
+        if (loadedNextId !== null) {
+            keyboardFocusId = loadedNextId
+            focusCardWhenReady(getState, loadedNextId, { mode: "down" })
+        }
+    })
+}
+
+function moveFocus(
+    dispatch,
+    getState,
+    item: RSSItem,
+    e: KeyboardEvent,
+    direction: -1 | 1
+) {
+    e.preventDefault()
+    resetPositionCycle()
+    const state = getState()
+    const feedId = state.page.feedId
+    const feed = state.feeds[feedId]
+    if (!feed) return
+    if (!e.repeat || keyboardFocusId === null) keyboardFocusId = item._id
+    let index = feed.iids.indexOf(keyboardFocusId)
+    if (index < 0) {
+        keyboardFocusId = item._id
+        index = feed.iids.indexOf(keyboardFocusId)
+    }
+    if (index < 0) return
+    const anchorId = keyboardFocusId
+    const targetIndex = index + direction
+    if (targetIndex < 0) {
+        keyboardFocusId = feed.iids[0]
+        focusCardWhenReady(getState, feed.iids[0], { mode: "up" })
+        return
+    }
+    if (targetIndex >= feed.iids.length) {
+        if (direction > 0 && !feed.allLoaded && !feed.loading) {
+            dispatch(loadMore(feed))
+                .then(() => {
+                    const nextState = getState()
+                    if (!navigationStillValid(feedId, nextState.page.feedId))
+                        return
+                    const nextFeed = nextState.feeds[feedId]
+                    if (!nextFeed) return
+                    const loadedNextId = getNextItemId(nextFeed.iids, anchorId)
+                    if (loadedNextId !== null) {
+                        keyboardFocusId = loadedNextId
+                        focusCardWhenReady(getState, loadedNextId, {
+                            mode: "down",
+                        })
+                    }
+                })
+                .catch(() => {})
+        }
+        return
+    }
+    const nextId = feed.iids[targetIndex]
+    keyboardFocusId = nextId
+    focusCardWhenReady(getState, nextId, {
+        mode: direction > 0 ? "down" : "up",
+    })
+}
+
+function cycleFocusedPosition(
+    getState: () => any,
+    item: RSSItem,
+    e: KeyboardEvent
+) {
+    e.preventDefault()
+    const state: ShortcutState = getState()
+    const feed = state.feeds ? state.feeds[state.page.feedId] : null
+    const iids: number[] = feed && Array.isArray(feed.iids) ? feed.iids : []
+    const activeId = getActiveCardId()
+    // Prefer the row the user actually has focused, then the tracked id, then
+    // the card that fired the event — but only when it belongs to this feed.
+    const candidates = [activeId, keyboardFocusId, item._id]
+    let targetId: number | null = null
+    for (const candidate of candidates) {
+        if (
+            candidate !== null &&
+            candidate !== undefined &&
+            iids.includes(candidate)
+        ) {
+            targetId = candidate
+            break
+        }
+    }
+    if (targetId === null) return
+    // A different row than the cycle was running on means the user moved focus;
+    // start the cycle over at center for it.
+    if (keyboardFocusId !== null && keyboardFocusId !== targetId) {
+        resetPositionCycle()
+    }
+    keyboardFocusId = targetId
+    focusCardWhenReady(getState, targetId, {
+        position: focusPositionCycle.applyCurrent(),
+    })
+}
+
+// "list": a key pressed on a focused list card, acting on that card's item.
+// "article": a key pressed in the open article, including keys forwarded from
+// its webview, acting on the open item.
+export type ItemShortcutOrigin = "list" | "article"
+
+export function itemShortcuts(
+    item: RSSItem,
+    e: KeyboardEvent,
+    origin: ItemShortcutOrigin = "list"
+): AppThunk<Promise<void>> {
+    return async (dispatch, getState) => {
+        const fromArticle = origin === "article"
         if (e.metaKey) return
+        const state = getState()
+        const feedId = state.page.feedId
+        if (lastFeedId !== null && lastFeedId !== feedId) {
+            // Never carry a focus id, position cycle or backlog across feeds.
+            resetItemShortcutState()
+            focusGeneration += 1
+        }
+        lastFeedId = feedId
+        const activeElement =
+            typeof document !== "undefined" ? document.activeElement : null
+        if (
+            isComposingEvent(e) ||
+            isEditableTarget(e.target) ||
+            isEditableTarget(activeElement) ||
+            isOverlayOpen(state.app) ||
+            // The open article's webview holds focus while it is shown, so
+            // only list keys are inert there.
+            (!fromArticle && isWebviewActive(activeElement))
+        ) {
+            return
+        }
+        const action = fromArticle
+            ? null
+            : getCardShortcutAction(e, state.app, activeElement)
+        switch (action) {
+            case "markReadAndNext":
+                e.preventDefault()
+                e.stopPropagation()
+                enqueueMarkReadAndNext(dispatch, getState, item, e.repeat)
+                return
+            case "moveUp":
+                e.stopPropagation()
+                moveFocus(dispatch, getState, item, e, -1)
+                return
+            case "moveDown":
+                e.stopPropagation()
+                moveFocus(dispatch, getState, item, e, 1)
+                return
+            case "cyclePosition":
+                e.stopPropagation()
+                cycleFocusedPosition(getState, item, e)
+                return
+        }
+        if (e.ctrlKey || e.altKey) return
         switch (e.key) {
             case "m":
             case "M":

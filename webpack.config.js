@@ -2,6 +2,8 @@ const HtmlWebpackPlugin = require("html-webpack-plugin")
 const NodePolyfillPlugin = require("node-polyfill-webpack-plugin")
 const { GriffelPlugin } = require("@griffel/webpack-plugin")
 const MiniCssExtractPlugin = require("mini-css-extract-plugin")
+const path = require("path")
+const SOURCE_DIR = path.resolve(__dirname, "src")
 
 module.exports = [
     {
@@ -16,7 +18,7 @@ module.exports = [
             rules: [
                 {
                     test: /\.ts$/,
-                    include: /src/,
+                    include: SOURCE_DIR,
                     resolve: {
                         extensions: [".ts", ".js"],
                     },
@@ -42,7 +44,7 @@ module.exports = [
             rules: [
                 {
                     test: /\.ts$/,
-                    include: /src/,
+                    include: SOURCE_DIR,
                     resolve: {
                         extensions: [".ts", ".js"],
                     },
@@ -68,14 +70,14 @@ module.exports = [
             rules: [
                 {
                     test: /\.(js|ts|tsx)$/,
-                    include: [/src/, /node_modules\/@fluentui/],
+                    include: [SOURCE_DIR, /node_modules[\\/]@fluentui/],
                     use: {
                         loader: "@griffel/webpack-plugin/loader",
                     },
                 },
                 {
                     test: /\.ts(x?)$/,
-                    include: /src/,
+                    include: SOURCE_DIR,
                     resolve: {
                         extensions: [".ts", ".tsx", ".js"],
                     },
