@@ -138,9 +138,6 @@ const utilsBridge = {
     focus: () => {
         ipcRenderer.invoke("request-focus")
     },
-    requestAttention: () => {
-        ipcRenderer.invoke("request-attention")
-    },
     addWindowStateListener: (
         callback: (type: WindowStateListenerType, state: boolean) => any
     ) => {

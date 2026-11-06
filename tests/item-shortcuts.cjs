@@ -162,7 +162,7 @@ function makeHarness(options = {}) {
     globalThis.document = document
     globalThis.window = {
         innerWidth: 1200,
-        utils: { openExternal() {}, requestAttention() {} },
+        utils: { openExternal() {} },
         settings: { getFilterType: () => null },
     }
     globalThis.getComputedStyle = () => ({ getPropertyValue: () => "" })

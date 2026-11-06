@@ -335,9 +335,6 @@ export function fetchItems(
                                     dispatch(pushNotification(item))
                                 }
                             }
-                            if (inserted.length > 0) {
-                                window.utils.requestAttention()
-                            }
                         } else {
                             dispatch(dismissItems())
                         }

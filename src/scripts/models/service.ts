@@ -337,7 +337,6 @@ function fetchItems(
                 for (let item of inserted) {
                     if (item.notify) dispatch(pushNotification(item))
                 }
-                if (inserted.length > 0) window.utils.requestAttention()
             }
             dispatch(saveServiceConfigs(configs))
         }

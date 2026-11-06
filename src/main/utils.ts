@@ -317,19 +317,6 @@ export function setUtilsListeners(manager: WindowManager) {
         }
     })
 
-    ipcMain.handle("request-attention", () => {
-        if (manager.hasWindow() && !manager.mainWindow.isFocused()) {
-            if (process.platform === "win32") {
-                manager.mainWindow.flashFrame(true)
-                manager.mainWindow.once("focus", () => {
-                    manager.mainWindow.flashFrame(false)
-                })
-            } else if (process.platform === "darwin") {
-                app.dock.bounce()
-            }
-        }
-    })
-
     ipcMain.handle("touchbar-init", (_, texts: TouchBarTexts) => {
         if (manager.hasWindow()) initMainTouchBar(texts, manager.mainWindow)
     })
