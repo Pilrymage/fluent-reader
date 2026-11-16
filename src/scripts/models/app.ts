@@ -35,6 +35,7 @@ import {
 import { getCurrentLocale } from "../settings"
 import locales from "../i18n/_locales"
 import { SYNC_SERVICE, ServiceActionTypes } from "./service"
+import { ApiError } from "./net/bff"
 
 export const enum ContextMenuType {
     Hidden,
@@ -400,6 +401,18 @@ export function initApp(): AppThunk<Promise<void>> {
         try {
             await dispatch(initSources())
         } catch (err) {
+            // 401/403 means the reverse proxy did not let the request through;
+            // the generic "report this on GitHub" dialog would be misleading.
+            if (
+                err instanceof ApiError &&
+                (err.status === 401 || err.status === 403)
+            ) {
+                await window.utils.showErrorBox(
+                    "未通过 SSO 认证",
+                    "请刷新页面，重新通过 pilrymage.com 的 SSO 登录。"
+                )
+                return
+            }
             console.error("Failed to initialize sources:", err)
             const details =
                 err instanceof Error && err.cause

@@ -60,12 +60,26 @@ function Article({ itemId }: ArticleProps) {
         loadWebpage,
         loadFull,
         fullContent,
+        detailContent,
         loaded,
         error,
+        isWebApp,
+        onFrameLoad,
         toggleWebpage,
         toggleFull,
         reload,
     } = useArticleView(item, source.openTarget)
+
+    // There is no Electron webview to host a remote page in the browser build,
+    // and most sites refuse to be framed, so open it in a tab instead.
+    const onToggleWebpage = useCallback(() => {
+        if (isWebApp) window.utils.openExternal(item.link)
+        else toggleWebpage()
+    }, [isWebApp, item.link, toggleWebpage])
+
+    const onToggleFull = useCallback(() => {
+        if (!isWebApp) toggleFull()
+    }, [isWebApp, toggleFull])
 
     const dismiss = () => dispatch(dismissItem())
     const handleToggleHidden = useCallback(() => {
@@ -83,8 +97,8 @@ function Article({ itemId }: ArticleProps) {
     }, [dispatch])
 
     // A key arriving immediately after navigation must use the committed item.
-    useLayoutEffect(() => {
-        return window.utils.addWebviewKeydownListener(input => {
+    const handleArticleInput = useCallback(
+        (input: any) => {
             if (input.type !== "keyDown") return
             switch (input.key) {
                 case "Escape":
@@ -96,11 +110,11 @@ function Article({ itemId }: ArticleProps) {
                     break
                 case "l":
                 case "L":
-                    toggleWebpage()
+                    onToggleWebpage()
                     break
                 case "w":
                 case "W":
-                    toggleFull()
+                    onToggleFull()
                     break
                 case "h":
                 case "H":
@@ -122,8 +136,23 @@ function Article({ itemId }: ArticleProps) {
                     break
                 }
             }
-        })
-    }, [dispatch, item, toggleWebpage, toggleFull, handleToggleHidden])
+        },
+        [dispatch, item, onToggleWebpage, onToggleFull, handleToggleHidden]
+    )
+
+    useLayoutEffect(() => {
+        if (isWebApp) {
+            // An iframe swallows its own keydowns; article.js relays them here.
+            const onMessage = (event: MessageEvent) => {
+                if (event.origin !== location.origin) return
+                if (event.data?.type !== "fr-keydown") return
+                handleArticleInput(event.data.input)
+            }
+            window.addEventListener("message", onMessage)
+            return () => window.removeEventListener("message", onMessage)
+        }
+        return window.utils.addWebviewKeydownListener(handleArticleInput)
+    }, [handleArticleInput, isWebApp])
 
     // `b` also works while focus is on the article's toolbar. Menus opened
     // from it render in portals, so only keys from inside the article count.
@@ -259,7 +288,6 @@ function Article({ itemId }: ArticleProps) {
     })
 
     const articleView = () => {
-        const a = encodeURIComponent(loadFull ? fullContent : item.content)
         const h = encodeURIComponent(
             renderToString(
                 <>
@@ -273,12 +301,26 @@ function Article({ itemId }: ArticleProps) {
                 </>
             )
         )
-        return `article/article.html?a=${a}&h=${h}&f=${encodeURIComponent(
+        const common = `h=${h}&f=${encodeURIComponent(
             fontFamily
-        )}&s=${fontSize}&d=${source.textDir}&u=${item.link}&m=${
-            loadFull ? 1 : 0
-        }`
+        )}&s=${fontSize}&d=${source.textDir}&u=${item.link}`
+        if (isWebApp) {
+            // Bodies average 2.8 KB and reach 144 KB, past the server's request
+            // header limit, so the frame pulls it by id via postMessage instead.
+            return `article/article.html?id=${item._id}&${common}`
+        }
+        const a = encodeURIComponent(loadFull ? fullContent : item.content)
+        return `article/article.html?a=${a}&${common}&m=${loadFull ? 1 : 0}`
     }
+
+    const handleFrameLoad = useCallback(() => {
+        const frame = webview.current as HTMLIFrameElement | null
+        frame?.contentWindow?.postMessage(
+            { type: "fr-article", id: item._id, article: detailContent },
+            location.origin
+        )
+        onFrameLoad()
+    }, [detailContent, item._id, onFrameLoad])
 
     return (
         <FocusZone className="article" onKeyDown={handleArticleKeyDown}>
@@ -343,17 +385,19 @@ function Article({ itemId }: ArticleProps) {
                         }}
                         onClick={() => dispatch(toggleStarred(item))}
                     />
-                    <CommandBarButton
-                        title={intl.get("article.loadFull")}
-                        className={loadFull ? "active" : ""}
-                        iconProps={{ iconName: "RawSource" }}
-                        onClick={toggleFull}
-                    />
+                    {!isWebApp && (
+                        <CommandBarButton
+                            title={intl.get("article.loadFull")}
+                            className={loadFull ? "active" : ""}
+                            iconProps={{ iconName: "RawSource" }}
+                            onClick={onToggleFull}
+                        />
+                    )}
                     <CommandBarButton
                         title={intl.get("article.loadWebpage")}
                         className={loadWebpage ? "active" : ""}
                         iconProps={{ iconName: "Globe" }}
-                        onClick={toggleWebpage}
+                        onClick={onToggleWebpage}
                     />
                     <CommandBarButton
                         title={intl.get("more")}
@@ -370,18 +414,31 @@ function Article({ itemId }: ArticleProps) {
                     />
                 </Stack>
             </Stack>
-            {showWebview && (
-                <webview
-                    id="article"
-                    className={error ? "error" : ""}
-                    ref={webview}
-                    key={webviewKey}
-                    src={loadWebpage ? item.link : articleView()}
-                    allowpopups={"true" as unknown as boolean}
-                    webpreferences="contextIsolation,disableDialogs,autoplayPolicy=document-user-activation-required"
-                    partition={loadWebpage ? "sandbox" : undefined}
-                />
-            )}
+            {showWebview &&
+                (!isWebApp || !!detailContent) &&
+                (isWebApp ? (
+                    <iframe
+                        id="article"
+                        className={error ? "error" : ""}
+                        ref={webview}
+                        key={webviewKey}
+                        src={articleView()}
+                        onLoad={handleFrameLoad}
+                        sandbox="allow-scripts allow-same-origin allow-popups"
+                        title={item.title}
+                    />
+                ) : (
+                    <webview
+                        id="article"
+                        className={error ? "error" : ""}
+                        ref={webview}
+                        key={webviewKey}
+                        src={loadWebpage ? item.link : articleView()}
+                        allowpopups={"true" as unknown as boolean}
+                        webpreferences="contextIsolation,disableDialogs,autoplayPolicy=document-user-activation-required"
+                        partition={loadWebpage ? "sandbox" : undefined}
+                    />
+                ))}
             {error && (
                 <Stack
                     className="error-prompt"

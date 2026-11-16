@@ -26,7 +26,8 @@ import {
     initRules,
     updateRulesForTarget,
 } from "./rule"
-import { fixBrokenGroups } from "./group"
+import { fixBrokenGroups, importSourceGroups } from "./group"
+import { fetchSources, isWeb } from "./net/bff"
 
 export const enum SourceOpenTarget {
     Local,
@@ -249,6 +250,21 @@ async function unreadCount(sources: SourceState): Promise<SourceState> {
 
 export function updateUnreadCounts(): AppThunk<Promise<void>> {
     return async (dispatch, getState) => {
+        if (isWeb()) {
+            // Counters are Miniflux's; re-read the source list instead of
+            // querying a local database that the browser does not have.
+            const { sources } = await fetchSources()
+            const counts = new Map(sources.map(s => [s.sid, s.unreadCount]))
+            const state: SourceState = {}
+            for (const source of Object.values(getState().sources)) {
+                state[source.sid] = {
+                    ...source,
+                    unreadCount: counts.get(source.sid) ?? 0,
+                }
+            }
+            dispatch({ type: UPDATE_UNREAD_COUNTS, sources: state })
+            return
+        }
         const sources: SourceState = {}
         for (let source of Object.values(getState().sources)) {
             sources[source.sid] = {
@@ -266,6 +282,25 @@ export function updateUnreadCounts(): AppThunk<Promise<void>> {
 export function initSources(): AppThunk<Promise<void>> {
     return async dispatch => {
         dispatch(initSourcesRequest())
+        if (isWeb()) {
+            // The BFF owns the data; unread counts arrive with the sources, and
+            // the grouping is Miniflux's category list.
+            const { sources, groups } = await fetchSources()
+            dispatch(initRules())
+            const state: SourceState = {}
+            for (const source of sources) {
+                const rssSource = new RSSSource(source.url, source.name)
+                rssSource.sid = source.sid
+                rssSource.iconurl = source.iconurl
+                rssSource.unreadCount = source.unreadCount
+                rssSource.lastFetched = new Date(source.lastFetched ?? 0)
+                state[source.sid] = rssSource
+            }
+            dispatch(importSourceGroups(groups))
+            dispatch(fixBrokenGroups(state))
+            dispatch(initSourcesSuccess(state))
+            return
+        }
         await init()
         const sourcesData = await database.select().from(sourcesTable)
         dispatch(initRules())
@@ -497,6 +532,9 @@ export function updateFavicon(
     force = false
 ): AppThunk<Promise<void>> {
     return async (dispatch, getState) => {
+        // In the browser the BFF resolves every icon itself (Miniflux → site →
+        // monogram) and window.db cannot store the result.
+        if (isWeb()) return
         const initSources = getState().sources
         if (!sids) {
             sids = Object.values(initSources)

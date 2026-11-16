@@ -45,6 +45,10 @@ function makeHarness(options = {}) {
         inArrayCalls: [],
         rafQueue: [],
         unreadFilter: Boolean(options.unreadFilter),
+        web: false,
+        queuedReads: [],
+        readBatches: [],
+        markedSources: [],
     }
     const feedId = options.feedId || "ALL"
     const iids = options.iids || [1, 2, 3]
@@ -52,7 +56,8 @@ function makeHarness(options = {}) {
     const cardHeight = options.cardHeight || 100
     const clientHeight = options.clientHeight || 600
     const scrollHeight = options.scrollHeight || 4000
-    const containerTop = options.containerTop === undefined ? 32 : options.containerTop
+    const containerTop =
+        options.containerTop === undefined ? 32 : options.containerTop
     const navBottom = options.navBottom === undefined ? 32 : options.navBottom
 
     const items = {}
@@ -196,6 +201,10 @@ function makeHarness(options = {}) {
                 }
             }
         }
+        if (action.type === "MARK_UNREAD") {
+            const item = env.state.items[action.item._id]
+            if (item) item.hasRead = false
+        }
         return action
     }
 
@@ -231,7 +240,9 @@ function makeHarness(options = {}) {
             desc: () => ({}),
             sql: () => ({}),
         },
-        "../date": { getValidDate: (...dates) => dates.find(Boolean) || new Date() },
+        "../date": {
+            getValidDate: (...dates) => dates.find(Boolean) || new Date(),
+        },
         "react-intl-universal": { get: key => key },
         "../utils": {
             domParser: {},
@@ -270,6 +281,27 @@ function makeHarness(options = {}) {
             setupAutoFetch: () => ({ type: "AUTO" }),
             SettingsActionTypes: {},
             FREE_MEMORY: "FREE_MEMORY",
+        },
+        // The browser build talks to the BFF instead of SQLite. env.web stays
+        // false by default so the existing cases keep exercising the DB path.
+        "./net/bff": {
+            isWeb: () => env.web,
+            markSourcesRead: sids => {
+                env.markedSources.push(...sids)
+                return Promise.resolve()
+            },
+            setReadBatch: (ids, value) => {
+                env.readBatches.push({ ids, value })
+                return Promise.resolve()
+            },
+            setStar: () => Promise.resolve(),
+            fetchItemDetail: () => Promise.resolve(null),
+            fetchItems: () => Promise.resolve({ items: [], next: null }),
+        },
+        "./net/read-queue": {
+            queueReadState: (id, value) => {
+                env.queuedReads.push({ id, value })
+            },
         },
     }
 
@@ -321,7 +353,11 @@ function shiftR() {
         key: "R",
         shiftKey: true,
         code: "KeyR",
-        target: { tagName: "DIV", isContentEditable: false, closest: () => null },
+        target: {
+            tagName: "DIV",
+            isContentEditable: false,
+            closest: () => null,
+        },
     })
 }
 
@@ -360,7 +396,11 @@ test("Ctrl+L follows a newly focused row and resets the cycle to center", async 
 })
 
 test("Ctrl+L never reuses a stale keyboard focus id across categories", async () => {
-    const env = makeHarness({ feedId: "A", iids: [1, 2, 3], offsets: { 1: 1000 } })
+    const env = makeHarness({
+        feedId: "A",
+        iids: [1, 2, 3],
+        offsets: { 1: 1000 },
+    })
     await press(env, env.state.items[1], ctrlL(env.cards.get(1)))
     assert.equal(env.focusedIds[0], 1)
 
@@ -431,7 +471,11 @@ test("a pending focus retry is cancelled when settings open", async () => {
         rendered: [1],
         offsets: { 1: 1000 },
     })
-    await press(env, env.state.items[1], keyEvent({ target: cardTarget(env.cards.get(1)) }))
+    await press(
+        env,
+        env.state.items[1],
+        keyEvent({ target: cardTarget(env.cards.get(1)) })
+    )
     await settle()
     assert.ok(env.rafQueue.length >= 1)
     env.state.app.settings.display = true
@@ -448,7 +492,11 @@ test("a pending focus retry is cancelled when the category changes", async () =>
         rendered: [1],
         offsets: { 1: 1000 },
     })
-    await press(env, env.state.items[1], keyEvent({ target: cardTarget(env.cards.get(1)) }))
+    await press(
+        env,
+        env.state.items[1],
+        keyEvent({ target: cardTarget(env.cards.get(1)) })
+    )
     await settle()
     assert.ok(env.rafQueue.length >= 1)
     env.state.feeds.OTHER = {
@@ -488,7 +536,8 @@ test("Shift+R marks once and captures the category sids at press time", async ()
     let captured = null
     const down = e => {
         if (
-            env.kb.getGlobalShortcutAction(e, env.state.app) === "markAllRead" &&
+            env.kb.getGlobalShortcutAction(e, env.state.app) ===
+                "markAllRead" &&
             !tracker.has(e)
         ) {
             tracker.add(e)
@@ -517,7 +566,11 @@ test("held r advances one row per repeat without coalescing", async () => {
     }
     await env.itemMod.whenMarkReadQueueIdle()
     for (let id = 1; id <= 7; id += 1) {
-        assert.equal(env.state.items[id].hasRead, true, `row ${id} must be read`)
+        assert.equal(
+            env.state.items[id].hasRead,
+            true,
+            `row ${id} must be read`
+        )
     }
     assert.equal(env.state.items[8].hasRead, false, "landing row stays unread")
     assert.equal(env.document.activeElement.id, 8)
@@ -605,6 +658,30 @@ test("list keys stay inert inside the open article", async () => {
     assert.deepEqual(opened, [])
     assert.equal(env.state.items[1].hasRead, false)
     assert.deepEqual(env.focusedIds, [])
+})
+test("web mode paints the read state first and queues the write", async () => {
+    const env = makeHarness({ iids: [1, 2] })
+    env.web = true
+    const item = env.state.items[1]
+    // No network is available here at all: the optimistic dispatch must not
+    // wait for one, and the request goes through the coalescing queue.
+    await env.dispatch(env.itemMod.markRead(item))
+    assert.equal(env.state.items[1].hasRead, true)
+    assert.deepEqual(env.queuedReads, [{ id: 1, value: true }])
+    assert.deepEqual(env.readBatches, [])
+    await env.dispatch(env.itemMod.markUnread(env.state.items[1]))
+    assert.equal(env.state.items[1].hasRead, false)
+    assert.deepEqual(env.queuedReads, [
+        { id: 1, value: true },
+        { id: 1, value: false },
+    ])
+})
+
+test("web mode marks a whole group read in one request", async () => {
+    const env = makeHarness({ iids: [1, 2], sids: [7, 8] })
+    env.web = true
+    await env.dispatch(env.itemMod.markAllRead([7, 8]))
+    assert.deepEqual(env.markedSources, [7, 8])
 })
 ;(async () => {
     for (const [name, fn] of tests) {

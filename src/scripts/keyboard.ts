@@ -84,7 +84,10 @@ export function isOverlayOpen(app: ShortcutAppState): boolean {
 export function isWebviewActive(activeElement): boolean {
     if (!activeElement) return false
     return (
-        String((activeElement as any).tagName || "").toUpperCase() === "WEBVIEW"
+        // An Electron webview or, in the browser build, the article iframe.
+        ["WEBVIEW", "IFRAME"].includes(
+            String((activeElement as any).tagName || "").toUpperCase()
+        )
     )
 }
 
@@ -335,7 +338,10 @@ export class StepQueue {
                 return
             }
             this.queue.push({ task, resolve })
-            this.maxPendingSeen = Math.max(this.maxPendingSeen, this.queue.length)
+            this.maxPendingSeen = Math.max(
+                this.maxPendingSeen,
+                this.queue.length
+            )
             if (!this.running) {
                 this.running = true
                 void this.drainNext()

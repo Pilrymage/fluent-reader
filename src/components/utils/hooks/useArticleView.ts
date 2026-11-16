@@ -8,6 +8,7 @@ import {
 import { RSSItem } from "../../../scripts/models/item"
 import { SourceOpenTarget } from "../../../scripts/models/source"
 import { decodeFetchResponse } from "../../../scripts/utils"
+import { fetchItemDetail, isWeb } from "../../../scripts/models/net/bff"
 
 function initialView(itemId: number, openTarget: SourceOpenTarget) {
     return {
@@ -32,7 +33,7 @@ function articleCard(itemId: number) {
 export function useArticleView(item: RSSItem, openTarget: SourceOpenTarget) {
     const itemId = item._id
     const [view, setView] = useState(() => initialView(itemId, openTarget))
-    const webview = useRef<Electron.WebviewTag>(null)
+    const webview = useRef<any>(null)
     const refocusItemId = useRef(itemId)
 
     // Reset before committing a new article so it never mounts the previous mode
@@ -42,6 +43,36 @@ export function useArticleView(item: RSSItem, openTarget: SourceOpenTarget) {
     const loadWebpage = view.mode === SourceOpenTarget.Webpage
     const loadFull = view.mode === SourceOpenTarget.FullContent
     const showWebview = !loadFull || !!view.fullContent
+
+    const isWebApp = isWeb()
+    const [detailContent, setDetailContent] = useState("")
+
+    // The list response carries no body, so the browser build fetches it for
+    // the frame. Electron already has the content in the item row.
+    useEffect(() => {
+        if (!isWebApp || !showWebview || loadWebpage || loadFull) return
+        let cancelled = false
+        setDetailContent("")
+        fetchItemDetail(itemId)
+            .then(detail => {
+                if (!cancelled) setDetailContent(detail.content)
+            })
+            .catch(() => {
+                if (!cancelled)
+                    setView(current => ({
+                        ...current,
+                        loaded: true,
+                        error: "ARTICLE_LOAD_FAILED",
+                    }))
+            })
+        return () => {
+            cancelled = true
+        }
+    }, [isWebApp, itemId, showWebview, loadWebpage, loadFull])
+
+    const onFrameLoad = useCallback(() => {
+        setView(current => ({ ...current, loaded: true }))
+    }, [])
 
     useLayoutEffect(() => {
         // Keep the close handler's target current even during a synchronous unmount.
@@ -133,7 +164,8 @@ export function useArticleView(item: RSSItem, openTarget: SourceOpenTarget) {
     const reload = () => {
         if (webview.current) {
             setView(view => ({ ...view, loaded: false, error: "" }))
-            webview.current.reload()
+            if (isWebApp) webview.current.contentWindow?.location.reload()
+            else webview.current.reload()
         } else if (loadFull) {
             setView(view => ({
                 ...view,
@@ -152,8 +184,11 @@ export function useArticleView(item: RSSItem, openTarget: SourceOpenTarget) {
         loadWebpage,
         loadFull,
         fullContent: view.fullContent,
+        detailContent,
         loaded: view.loaded,
         error: view.error,
+        isWebApp,
+        onFrameLoad,
         toggleWebpage,
         toggleFull,
         reload,

@@ -250,6 +250,38 @@ export function fixBrokenGroups(sources: SourceState): AppThunk {
     }
 }
 
+/**
+ * Replace the group list with the server's categories.
+ *
+ * In the browser build Miniflux owns the grouping, so a browser-local edit can
+ * only last until the next load. Expansion state is still the reader's own
+ * preference and survives, keyed by the stable gid the server assigns.
+ */
+export function importSourceGroups(
+    groups: { gid: number; name: string; sids: number[] }[]
+): AppThunk {
+    return (dispatch, getState) => {
+        if (groups.length === 0) return
+        const previous = getState().groups
+        const next = groups.map(entry => {
+            const group = new SourceGroup(
+                entry.gid,
+                [...entry.sids],
+                entry.name
+            )
+            const prior = previous.find(g => g.gid === entry.gid)
+            if (group.isMultiple && typeof prior?.expanded === "boolean") {
+                group.expanded = prior.expanded
+            }
+            return group
+        })
+        dispatch(reorderSourceGroupsDone(next))
+        // Persisting keeps the next render (and a reload without a server) in
+        // step; importSourceGroups overwrites it on every load anyway.
+        window.settings.saveGroups(getState().groups)
+    }
+}
+
 function outlineToSource(
     outline: Element
 ): [ReturnType<typeof addSource>, string] {

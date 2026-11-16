@@ -1,0 +1,17 @@
+{
+    "name": "@fluent-reader-custom/server",
+    "private": true,
+    "type": "module",
+    "description": "Headless feed fetcher and HTTP API for Fluent Reader Custom",
+    "engines": {
+        "node": ">=22.18"
+    },
+    "scripts": {
+        "start": "node src/index.ts",
+        "seed": "node src/seed.ts",
+        "refresh": "node src/index.ts --refresh-once"
+    },
+    "dependencies": {
+        "rss-parser": "^3.13.0"
+    }
+}

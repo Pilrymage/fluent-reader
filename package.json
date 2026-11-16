@@ -5,6 +5,7 @@
   "main": "./dist/electron.js",
   "scripts": {
     "build": "webpack --config ./webpack.config.js",
+    "build:web": "webpack --config ./webpack.config.web.js",
     "package-custom": "electron-builder --win zip --x64 -p never -c.electronDist=node_modules/electron/dist -c.win.signAndEditExecutable=false",
     "electron": "electron ./dist/electron.js",
     "start": "npm run build && npm run electron",
@@ -23,7 +24,8 @@
   "license": "BSD-3-Clause",
   "sideEffects": [
     "*.css",
-    "./src/custom-runtime.ts"
+    "./src/custom-runtime.ts",
+    "./src/web-runtime.ts"
   ],
   "repository": "github:Pilrymage/fluent-reader",
   "devDependencies": {

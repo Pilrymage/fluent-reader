@@ -13,3 +13,4 @@ bin/*
 /tests/custom-e2e/*-results.json
 /tests/custom-e2e/*.log
 logs/
+dist-web/

@@ -270,6 +270,11 @@ export const Menu: React.FC = () => {
                             alt=""
                             className={menuClasses.favicon}
                             src={s.iconurl}
+                            onError={e => {
+                                // A dead icon endpoint must not leave a broken
+                                // image box in the list.
+                                e.currentTarget.style.display = "none"
+                            }}
                         />
                     ) : undefined
                 }

@@ -13,6 +13,15 @@ import {
 } from "../utils"
 import { RSSSource, updateSource, updateUnreadCounts } from "./source"
 import {
+    fetchItemDetail,
+    fetchItems as fetchItemsApi,
+    isWeb,
+    markSourcesRead,
+    setStar,
+} from "./net/bff"
+import { queueReadState } from "./net/read-queue"
+import { RSSFeed, initFeedSuccess } from "./feed"
+import {
     getCardShortcutAction,
     getNextItemId,
     pickNextAfterRemoval,
@@ -266,6 +275,25 @@ export function fetchItems(
     sids: number[] = null
 ): AppThunk<Promise<void>> {
     return async (dispatch, getState) => {
+        if (isWeb()) {
+            // The server is the fetcher. Ask Miniflux for a round, then reload
+            // the feed the user is looking at from the BFF.
+            const state = getState()
+            const feed = state.feeds[state.page.feedId]
+            try {
+                await fetch(`${location.origin}/api/refresh`, {
+                    method: "POST",
+                })
+                if (feed) {
+                    const page = await RSSFeed.loadFeed(feed)
+                    dispatch(initFeedSuccess({ ...feed, loaded: true }, page))
+                }
+                dispatch(updateUnreadCounts())
+            } catch (err) {
+                console.log(err)
+            }
+            return
+        }
         let promises = new Array<Promise<RSSItem[]>>()
         const initState = getState()
         if (!initState.app.fetchingItems && !initState.app.syncing) {
@@ -368,11 +396,21 @@ export function markRead(item: RSSItem): AppThunk<Promise<void>> {
     return async (dispatch, getState) => {
         item = getState().items[item._id]
         if (!item.hasRead) {
-            await database
-                .update(itemsTable)
-                .set({ hasRead: true })
-                .where(eq(itemsTable._id, item._id))
-            dispatch(markReadDone(item))
+            if (isWeb()) {
+                // Paint first, write later: a keypress must not wait for a
+                // round trip, and the queue folds bursts into one request.
+                dispatch(markReadDone(item))
+                const id = item._id
+                queueReadState(id, true, () =>
+                    dispatch(markUnreadDone(getState().items[id]))
+                )
+            } else {
+                await database
+                    .update(itemsTable)
+                    .set({ hasRead: true })
+                    .where(eq(itemsTable._id, item._id))
+                dispatch(markReadDone(item))
+            }
             if (item.serviceRef) dispatch(pushReadState(item, true))
         }
     }
@@ -405,10 +443,16 @@ export function markAllRead(
                 before ? lte(itemsTable.date, date) : gte(itemsTable.date, date)
             )
         }
-        await database
-            .update(itemsTable)
-            .set({ hasRead: true })
-            .where(and(...conditions))
+        if (isWeb()) {
+            // One request for the whole group instead of one per source. The
+            // date cutoff is not honored by the BFF.
+            await markSourcesRead(sids)
+        } else {
+            await database
+                .update(itemsTable)
+                .set({ hasRead: true })
+                .where(and(...conditions))
+        }
         if (date) {
             dispatch({
                 type: MARK_ALL_READ,
@@ -430,11 +474,19 @@ export function markUnread(item: RSSItem): AppThunk<Promise<void>> {
     return async (dispatch, getState) => {
         item = getState().items[item._id]
         if (item.hasRead) {
-            await database
-                .update(itemsTable)
-                .set({ hasRead: false })
-                .where(eq(itemsTable._id, item._id))
-            dispatch(markUnreadDone(item))
+            if (isWeb()) {
+                dispatch(markUnreadDone(item))
+                const id = item._id
+                queueReadState(id, false, () =>
+                    dispatch(markReadDone(getState().items[id]))
+                )
+            } else {
+                await database
+                    .update(itemsTable)
+                    .set({ hasRead: false })
+                    .where(eq(itemsTable._id, item._id))
+                dispatch(markUnreadDone(item))
+            }
             if (item.serviceRef) dispatch(pushReadState(item, false))
         }
     }
@@ -447,10 +499,14 @@ const toggleStarredDone = (item: RSSItem): ItemActionTypes => ({
 
 export function toggleStarred(item: RSSItem): AppThunk<Promise<void>> {
     return async dispatch => {
-        await database
-            .update(itemsTable)
-            .set({ starred: !item.starred })
-            .where(eq(itemsTable._id, item._id))
+        if (isWeb()) {
+            await setStar(item._id, !item.starred)
+        } else {
+            await database
+                .update(itemsTable)
+                .set({ starred: !item.starred })
+                .where(eq(itemsTable._id, item._id))
+        }
         dispatch(toggleStarredDone(item))
         if (item.serviceRef) {
             const hooks = dispatch(getServiceHooks())
@@ -467,16 +523,22 @@ const toggleHiddenDone = (item: RSSItem): ItemActionTypes => ({
 
 export function toggleHidden(item: RSSItem): AppThunk<Promise<void>> {
     return async dispatch => {
-        await database
-            .update(itemsTable)
-            .set({ hidden: !item.hidden })
-            .where(eq(itemsTable._id, item._id))
+        // "Hidden" is a local preference; the BFF has no field for it.
+        if (!isWeb()) {
+            await database
+                .update(itemsTable)
+                .set({ hidden: !item.hidden })
+                .where(eq(itemsTable._id, item._id))
+        }
         dispatch(toggleHiddenDone(item))
     }
 }
 
 const FOCUS_RETRY_TIMEOUT = 1200
 const FOCUS_RETRY_INTERVAL = 50
+// How many scroll nudges may accompany a pending focus. Together with the grace
+// frames this covers a full viewport of virtualized pages.
+const FOCUS_FORCE_RENDER_TRIES = 8 + 3
 
 let keyboardFocusId: number | null = null
 let lastFeedId: string | number | null = null
@@ -486,7 +548,11 @@ const markReadQueue = new StepQueue()
 type FocusScrollIntent = { mode: ScrollMode } | { position: FocusPosition }
 
 type ShortcutState = {
-    page?: { feedId?: string | number; itemId?: number | null; viewType?: number }
+    page?: {
+        feedId?: string | number
+        itemId?: number | null
+        viewType?: number
+    }
     feeds?: any
     app?: ShortcutAppState
 }
@@ -497,6 +563,16 @@ function scheduleFocusAttempt(attempt: () => void) {
     } else if (typeof setTimeout === "function") {
         setTimeout(attempt, FOCUS_RETRY_INTERVAL)
     }
+}
+
+// The row a focus attempt is currently travelling to. While it is pending the
+// DOM still holds focus on the previous card, so a keypress arriving from that
+// card must not re-anchor the walk there: doing so recomputes the same target
+// and the cursor looks stuck in a loop.
+let pendingFocusId: number | null = null
+
+function clearPendingFocus() {
+    pendingFocusId = null
 }
 
 function getActiveCardId(): number | null {
@@ -583,6 +659,66 @@ function isFocusContextActive(
     return true
 }
 
+/** Where the row with `index` should sit, given only the container's height. */
+function estimateCardScrollTop(
+    container: HTMLElement,
+    index: number,
+    count: number
+): number | null {
+    if (index < 0 || count <= 0) return null
+    const maxScrollTop = Math.max(
+        0,
+        container.scrollHeight - container.clientHeight
+    )
+    if (maxScrollTop <= 0) return null
+    const ratio = (index + 0.5) / count
+    const target = ratio * container.scrollHeight - container.clientHeight / 2
+    return Math.max(0, Math.min(maxScrollTop, target))
+}
+
+/**
+ * Offsets (in viewport heights) tried around the estimated position. Virtualized
+ * lists only materialize pages near the viewport and the ratio above is only an
+ * approximation of the row height, so the first guess can be off by a page.
+ * Scanning both ways a few times lands on the target without assuming the
+ * estimate is exact.
+ */
+const FORCE_RENDER_OFFSETS = [0, -0.5, 0.5, -1, 1, -1.5, 1.5, -2]
+
+// Frames to let React flush before concluding that the row will never appear on
+// its own. Rows that are about to be rendered arrive within this grace period,
+// and scrolling first would yank the list out from under an ordinary keypress.
+const FOCUS_RENDER_GRACE_FRAMES = 3
+
+/**
+ * Move the container so the list materializes the row we are about to focus.
+ *
+ * The feed keeps lists virtualized: only pages near the viewport exist in the
+ * DOM, so a row below the fold has no node to focus. Scrolling is what makes the
+ * list render it, so waiting for the node to appear on its own deadlocks — the
+ * cursor stops at the last rendered row and each further keypress re-anchors
+ * there.
+ */
+function scrollToForceRender(
+    container: HTMLElement,
+    anchor: number,
+    attempt: number,
+    intent?: FocusScrollIntent
+): boolean {
+    const maxScrollTop = Math.max(
+        0,
+        container.scrollHeight - container.clientHeight
+    )
+    if (maxScrollTop <= 0) return false
+    const step =
+        FORCE_RENDER_OFFSETS[Math.min(attempt, FORCE_RENDER_OFFSETS.length - 1)]
+    const bias = intent && "mode" in intent && intent.mode === "up" ? -1 : 1
+    const before = container.scrollTop
+    const target = anchor + step * container.clientHeight * bias
+    container.scrollTop = Math.max(0, Math.min(maxScrollTop, target))
+    return Math.abs(container.scrollTop - before) > 1
+}
+
 function focusCardWhenReady(
     getState: () => any,
     id: number,
@@ -597,10 +733,27 @@ function focusCardWhenReady(
     const deadline = Date.now() + FOCUS_RETRY_TIMEOUT
     const findCard = () =>
         document.querySelector(selector) as HTMLElement | null
+    const container = getScrollContainer()
+    const feed = state.feeds ? state.feeds[feedId] : null
+    const iids: number[] = feed && Array.isArray(feed.iids) ? feed.iids : []
+    // Anchor the scan where the row should be, falling back to where we are.
+    const anchor =
+        (container &&
+            estimateCardScrollTop(container, iids.indexOf(id), iids.length)) ??
+        (container ? container.scrollTop : 0)
+    let forced = 0
+    pendingFocusId = id
+
+    const finish = () => {
+        if (pendingFocusId === id) pendingFocusId = null
+    }
 
     const attempt = () => {
         if (token !== focusGeneration) return
-        if (!isFocusContextActive(getState, feedId, id)) return
+        if (!isFocusContextActive(getState, feedId, id)) {
+            finish()
+            return
+        }
         const target = findCard()
         if (target) {
             // FocusZone assigns tabindex only after it observes a card. Newly
@@ -615,9 +768,31 @@ function focusCardWhenReady(
             } catch {
                 target.focus()
             }
+            finish()
             return
         }
-        if (Date.now() >= deadline) return
+        if (Date.now() >= deadline) {
+            finish()
+            return
+        }
+        // The card is not rendered yet. Give React a couple of frames first: a
+        // row that is about to render must not yank the list around. Only then
+        // assume it sits outside the virtualized window, where scrolling is the
+        // only thing that makes the list create its node.
+        const waited = forced + 1
+        if (
+            container &&
+            waited > FOCUS_RENDER_GRACE_FRAMES &&
+            forced < FOCUS_FORCE_RENDER_TRIES
+        ) {
+            scrollToForceRender(
+                container,
+                anchor,
+                forced - FOCUS_RENDER_GRACE_FRAMES,
+                intent
+            )
+        }
+        forced = waited
         scheduleFocusAttempt(attempt)
     }
 
@@ -631,14 +806,19 @@ export function cancelPendingMarkRead(): void {
 export function resetItemShortcutState(): void {
     markReadQueue.cancelPending()
     keyboardFocusId = null
+    clearPendingFocus()
     resetPositionCycle()
 }
 
 export function noteCardFocus(id: number | null): void {
     if (id === null || !Number.isFinite(id)) return
-    // Programmatic focus sets keyboardFocusId before focusing, so this only
-    // resets when the user moved focus to a different row.
-    if (keyboardFocusId !== id) resetPositionCycle()
+    // Real DOM focus is the ground truth: a click, Tab or a landed programmatic
+    // focus all report here. Keeping the walk cursor in sync with it is what
+    // makes an ordinary keypress safe to act on without re-anchoring, and it
+    // stops a failed focus attempt from pinning the cursor to a stale row.
+    keyboardFocusId = id
+    clearPendingFocus()
+    resetPositionCycle()
 }
 
 export function whenMarkReadQueueIdle(): Promise<void> {
@@ -652,9 +832,12 @@ function enqueueMarkReadAndNext(
     repeat: boolean
 ) {
     const startFeedId = getState().page.feedId
-    // Each physical keydown targets one row. A non-repeat press re-anchors on
-    // the card that fired the event; repeats keep following keyboardFocusId.
-    if (!repeat || keyboardFocusId === null) keyboardFocusId = item._id
+    // The walk cursor — not the card that fired the keydown — says where the
+    // reader is. focusin (noteCardFocus) keeps it in sync with real DOM focus,
+    // so the two only differ while a programmatic focus is still travelling to
+    // a row the virtualized list has not rendered yet. Re-anchoring on the old
+    // card there would recompute the same target forever: the stuck loop.
+    if (keyboardFocusId === null) keyboardFocusId = item._id
     markReadQueue.enqueue(async () => {
         const state = getState()
         if (!navigationStillValid(startFeedId, state.page.feedId)) return
@@ -710,7 +893,11 @@ function moveFocus(
     const feedId = state.page.feedId
     const feed = state.feeds[feedId]
     if (!feed) return
-    if (!e.repeat || keyboardFocusId === null) keyboardFocusId = item._id
+    // Same rule as mark-read-and-next: the walk cursor is authoritative, and
+    // focusin keeps it equal to the real DOM focus whenever focus actually
+    // lands. A keypress from a card the cursor has already left therefore moves
+    // on instead of stepping back.
+    if (keyboardFocusId === null) keyboardFocusId = item._id
     let index = feed.iids.indexOf(keyboardFocusId)
     if (index < 0) {
         keyboardFocusId = item._id
@@ -947,7 +1134,13 @@ export function itemReducer(
             switch (action.status) {
                 case ActionStatus.Success: {
                     let nextState = { ...state }
-                    for (let i of action.items) {
+                    // A page can hand back rows it did not display yet (the feed
+                    // keeps them for the next "load more"). They must be in the
+                    // item store already, or that page has nothing to show.
+                    for (let i of [
+                        ...(action.items ?? []),
+                        ...(action.carry ?? []),
+                    ]) {
                         nextState[i._id] = i
                     }
                     return nextState

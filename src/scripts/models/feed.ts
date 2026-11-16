@@ -17,6 +17,9 @@ import {
 } from "./item"
 import { ActionStatus, AppThunk, mergeSortedArrays } from "../utils"
 import { PageActionTypes, SELECT_PAGE, PageType, APPLY_FILTER } from "./page"
+import { fetchItems, isWeb } from "./net/bff"
+import type { ApiItem } from "./net/bff"
+import { flushReadQueue } from "./net/read-queue"
 
 export enum FilterType {
     None,
@@ -74,6 +77,95 @@ export const SOURCE = "SOURCE"
 
 const LOAD_QUANTITY = 50
 
+/**
+ * Build an RSSItem from a BFF row. Object.create keeps the prototype (instance
+ * helpers still work) without running the parser constructor.
+ */
+function toRssItem(raw: ApiItem): RSSItem {
+    const item = Object.create(RSSItem.prototype) as RSSItem
+    Object.assign(item, {
+        _id: raw._id,
+        source: raw.source,
+        title: raw.title,
+        link: raw.link,
+        date: new Date(raw.date),
+        fetchedDate: new Date(raw.date),
+        thumb: raw.thumb ?? undefined,
+        content: "",
+        snippet: raw.snippet,
+        creator: raw.creator ?? undefined,
+        hasRead: raw.hasRead,
+        starred: raw.starred,
+        hidden: false,
+        notify: false,
+    })
+    return item
+}
+
+/**
+ * One page of a feed. `next` is the cursor the server reports for the following
+ * page (null when it has no more); `carry` holds rows that were fetched but did
+ * not fit the display quota, so the next page can show them without asking the
+ * server for rows it already handed over.
+ */
+export type FeedPage = {
+    items: RSSItem[]
+    next: number | null
+    carry: RSSItem[]
+}
+
+export type FeedLoadOptions = {
+    /**
+     * Drop rows the feed already lists. Only appended pages want this: the
+     * first page replaces the order, so filtering it there would discard the
+     * rows the caller is about to throw away anyway.
+     */
+    skipKnown?: boolean
+}
+
+// A group is a filter over one global list, so a page of 50 rows can be almost
+// entirely foreign. Keep requesting until the quota is met instead of reporting
+// a short page as "everything is loaded"; a narrow group stops after this many
+// pages and continues on the next keypress/click.
+const MAX_PAGES_PER_LOAD = 5
+
+function pageOf(items: RSSItem[], next: number | null): FeedPage {
+    return { items, next, carry: [] }
+}
+
+/**
+ * Append a page to the visible order, skipping ids that are already listed.
+ * Offsets are approximate while reads are in flight, so an overlapping page is
+ * expected; a second copy of a row is not, because every focus helper resolves
+ * an id with indexOf and would bounce between the copies.
+ */
+function appendUniqueIds(existing: number[], items: RSSItem[]): number[] {
+    const seen = new Set(existing)
+    const next = [...existing]
+    for (const item of items ?? []) {
+        if (seen.has(item._id)) continue
+        seen.add(item._id)
+        next.push(item._id)
+    }
+    return next
+}
+
+/**
+ * A feed is exhausted when the server has no cursor left and nothing is held
+ * back. A short page alone proves nothing: a group slices a global window, so it
+ * can return fewer rows than the quota with plenty more still to come.
+ */
+function isFeedExhausted(
+    next: number | null | undefined,
+    carry: RSSItem[] | undefined,
+    items: RSSItem[] | undefined
+): boolean {
+    if ((carry?.length ?? 0) > 0) return false
+    if (next === null) return true
+    if (next === undefined) return (items?.length ?? 0) < LOAD_QUANTITY
+    return false
+}
+
 export class RSSFeed {
     _id: string
     loaded: boolean
@@ -82,6 +174,12 @@ export class RSSFeed {
     sids: number[]
     iids: number[]
     filter: FeedFilter
+    /** Server cursor for the next page. Null means the server has no more. */
+    next: number | null
+    /** Rows already fetched but not yet displayed, oldest first. */
+    carry: number[]
+    /** Read rows among iids at the moment `next` was issued. */
+    readAtCursor: number
 
     constructor(id: string = null, sids = [], filter = null) {
         this._id = id
@@ -90,12 +188,63 @@ export class RSSFeed {
         this.loaded = false
         this.allLoaded = false
         this.filter = filter === null ? new FeedFilter() : filter
+        this.next = null
+        this.carry = []
+        this.readAtCursor = 0
     }
 
-    static async loadFeed(feed: RSSFeed, skip = 0): Promise<RSSItem[]> {
-        if (feed.sids.length === 0) return []
+    static async loadFeed(
+        feed: RSSFeed,
+        cursor = 0,
+        options: FeedLoadOptions = {}
+    ): Promise<FeedPage> {
+        if (feed.sids.length === 0) return pageOf([], null)
         const filter = feed.filter
         const type = filter.type
+        if (isWeb()) {
+            const single = feed.sids.length === 1
+            const limit = single ? LOAD_QUANTITY : LOAD_QUANTITY * 4
+            // An offset can only be approximate while reads are in flight, so a
+            // page for "load more" may hand back rows that were just shown.
+            // Skipping them keeps the page at LOAD_QUANTITY genuinely new rows
+            // instead of shrinking to a handful and looking like the end.
+            const known = options.skipKnown
+                ? new Set(feed.iids ?? [])
+                : new Set<number>()
+            const collect = (page: RSSItem[]) =>
+                page.filter(
+                    item =>
+                        !known.has(item._id) &&
+                        (single || feed.sids.includes(item.source))
+                )
+            let taken = new Array<RSSItem>()
+            let next: number | null = cursor
+            for (let i = 0; i < MAX_PAGES_PER_LOAD; i += 1) {
+                if (next === null || taken.length >= LOAD_QUANTITY) break
+                const response = await fetchItems({
+                    source: single ? feed.sids[0] : undefined,
+                    unread: !(type & FilterType.ShowRead),
+                    starred: !(type & FilterType.ShowNotStarred),
+                    search: filter.search || undefined,
+                    limit,
+                    offset: next,
+                })
+                for (const item of collect(response.items.map(toRssItem))) {
+                    known.add(item._id)
+                    taken.push(item)
+                }
+                // Only an explicit null (or an empty page) ends the feed. A page
+                // of nothing but foreign or already-shown rows says nothing
+                // about whether the group/list has more.
+                next =
+                    response.next === null || response.items.length === 0
+                        ? null
+                        : response.next
+            }
+            const shown = taken.slice(0, LOAD_QUANTITY)
+            const rest = taken.slice(LOAD_QUANTITY)
+            return { items: shown, next, carry: rest }
+        }
         const conditions = [inArray(itemsTable.source, feed.sids)]
         if (!(type & FilterType.ShowRead))
             conditions.push(eq(itemsTable.hasRead, false))
@@ -137,13 +286,17 @@ export class RSSFeed {
                 }
             }
         }
-        return (await database
+        const local = (await database
             .select()
             .from(itemsTable)
             .where(and(...conditions))
             .orderBy(desc(itemsTable.date))
-            .offset(skip)
+            .offset(cursor)
             .limit(LOAD_QUANTITY)) as unknown as RSSItem[]
+        // SQLite pages by offset too, and a short page is the only end signal it
+        // gives: the local list is already narrowed by the filter.
+        const exhausted = local.length < LOAD_QUANTITY
+        return pageOf(local, exhausted ? null : cursor + local.length)
     }
 }
 
@@ -166,6 +319,9 @@ interface initFeedAction {
     status: ActionStatus
     feed?: RSSFeed
     items?: RSSItem[]
+    next?: number | null
+    carry?: RSSItem[]
+    readAtCursor?: number
     err?
 }
 
@@ -174,6 +330,9 @@ interface loadMoreAction {
     status: ActionStatus
     feed: RSSFeed
     items?: RSSItem[]
+    next?: number | null
+    carry?: RSSItem[]
+    readAtCursor?: number
     err?
 }
 
@@ -224,12 +383,16 @@ export function initFeedsSuccess(): FeedActionTypes {
 
 export function initFeedSuccess(
     feed: RSSFeed,
-    items: RSSItem[]
+    page: FeedPage
 ): FeedActionTypes {
     return {
         type: INIT_FEED,
         status: ActionStatus.Success,
-        items: items,
+        items: page.items,
+        next: page.next,
+        carry: page.carry,
+        // A page fetched under the unread filter is all unread by definition.
+        readAtCursor: 0,
         feed: feed,
     }
 }
@@ -249,8 +412,8 @@ export function initFeeds(force = false): AppThunk<Promise<void>> {
         for (let feed of Object.values(getState().feeds)) {
             if (!feed.loaded || force) {
                 let p = RSSFeed.loadFeed(feed)
-                    .then(items => {
-                        dispatch(initFeedSuccess(feed, items))
+                    .then(page => {
+                        dispatch(initFeedSuccess(feed, page))
                     })
                     .catch(err => {
                         console.log(err)
@@ -275,13 +438,17 @@ export function loadMoreRequest(feed: RSSFeed): FeedActionTypes {
 
 export function loadMoreSuccess(
     feed: RSSFeed,
-    items: RSSItem[]
+    page: FeedPage,
+    readAtCursor = 0
 ): FeedActionTypes {
     return {
         type: LOAD_MORE,
         status: ActionStatus.Success,
         feed: feed,
-        items: items,
+        items: page.items,
+        next: page.next,
+        carry: page.carry,
+        readAtCursor,
     }
 }
 
@@ -295,26 +462,100 @@ export function loadMoreFailure(feed: RSSFeed, err): FeedActionTypes {
 }
 
 export function loadMore(feed: RSSFeed): AppThunk<Promise<void>> {
-    return (dispatch, getState) => {
-        if (feed.loaded && !feed.loading && !feed.allLoaded) {
-            dispatch(loadMoreRequest(feed))
-            const state = getState()
-            const skipNum = feed.iids.filter(i =>
-                FeedFilter.testItem(feed.filter, state.items[i])
-            ).length
-            return RSSFeed.loadFeed(feed, skipNum)
-                .then(items => {
-                    dispatch(loadMoreSuccess(feed, items))
-                })
-                .catch(e => {
-                    console.log(e)
-                    dispatch(loadMoreFailure(feed, e))
-                })
+    return async (dispatch, getState) => {
+        if (!feed.loaded || feed.loading || feed.allLoaded) {
+            return Promise.reject()
         }
-        return new Promise((_, reject) => {
-            reject()
+        dispatch(loadMoreRequest(feed))
+        // A pending read write moves rows out of the server's unread list, so an
+        // offset taken before it lands would overlap the page just shown and
+        // duplicate rows. Send them first, then page from the server's cursor.
+        await flushReadQueue()
+        const state = getState()
+        const carried = (feed.carry ?? [])
+            .map(iid => state.items[iid])
+            .filter(Boolean)
+        // Carried rows were already handed over by the server; show them before
+        // asking for anything new, or a group feed would keep re-requesting the
+        // same global window.
+        const shown = carried.slice(0, LOAD_QUANTITY)
+        const rest = carried.slice(LOAD_QUANTITY)
+        if (shown.length >= LOAD_QUANTITY || feed.next === null) {
+            dispatch(
+                loadMoreSuccess(
+                    feed,
+                    {
+                        items: shown,
+                        next: feed.next ?? null,
+                        carry: rest,
+                    },
+                    readCount(feed, state)
+                )
+            )
+            return
+        }
+        return RSSFeed.loadFeed(feed, pageCursor(feed, state), {
+            skipKnown: true,
         })
+            .then(page => {
+                const latest = getState()
+                dispatch(
+                    loadMoreSuccess(
+                        feed,
+                        {
+                            items: [...shown, ...page.items],
+                            next: page.next,
+                            carry: page.carry,
+                        },
+                        // Baseline for the next page: every row read from here on
+                        // leaves the server's unread list and shifts it earlier.
+                        readCount(feed, latest)
+                    )
+                )
+            })
+            .catch(e => {
+                console.log(e)
+                dispatch(loadMoreFailure(feed, e))
+            })
     }
+}
+
+/** Rows already listed that the current filter still shows. */
+function visibleCount(feed: RSSFeed, state): number {
+    return (feed.iids ?? []).filter(iid => {
+        const item = state.items[iid]
+        return item && FeedFilter.testItem(feed.filter, item)
+    }).length
+}
+
+/** Read rows among the ids a feed already consumed (displayed or carried). */
+function readCount(feed: RSSFeed, state): number {
+    const ids = [...(feed.iids ?? []), ...(feed.carry ?? [])]
+    return ids.filter(iid => state.items[iid] && state.items[iid].hasRead)
+        .length
+}
+
+/**
+ * The offset to request next.
+ *
+ * The local SQLite path keeps using "how many matching rows are already shown":
+ * the database is the very list being paged, so counting is exact.
+ *
+ * The web path pages a server list and has to stay in the server's coordinates.
+ * That cursor was issued when the current page arrived, and every row read since
+ * then has left the server's unread list, shifting the following page one row
+ * earlier. `readAtCursor` records how many rows were already read back then, so
+ * the difference is exactly the shift. Undercounting only overlaps (harmless
+ * here, the append de-duplicates); overcounting would skip rows unseen.
+ */
+function pageCursor(feed: RSSFeed, state): number {
+    if (!isWeb() || feed.next === undefined || feed.next === null) {
+        return visibleCount(feed, state)
+    }
+    // A filter that keeps read rows pages a list the reads do not shrink.
+    if (feed.filter.type & FilterType.ShowRead) return feed.next
+    const shift = readCount(feed, state) - (feed.readAtCursor ?? 0)
+    return Math.max(0, feed.next - Math.max(0, shift))
 }
 
 export function feedReducer(
@@ -421,16 +662,25 @@ export function feedReducer(
             return nextState
         case INIT_FEED:
             switch (action.status) {
-                case ActionStatus.Success:
+                case ActionStatus.Success: {
+                    const iids = appendUniqueIds([], action.items)
                     return {
                         ...state,
                         [action.feed._id]: {
                             ...action.feed,
                             loaded: true,
-                            allLoaded: action.items.length < LOAD_QUANTITY,
-                            iids: action.items.map(i => i._id),
+                            allLoaded: isFeedExhausted(
+                                action.next,
+                                action.carry,
+                                action.items
+                            ),
+                            iids,
+                            next: action.next ?? null,
+                            carry: (action.carry ?? []).map(i => i._id),
+                            readAtCursor: action.readAtCursor ?? 0,
                         },
                     }
+                }
                 default:
                     return state
             }
@@ -444,19 +694,27 @@ export function feedReducer(
                             loading: true,
                         },
                     }
-                case ActionStatus.Success:
+                case ActionStatus.Success: {
+                    // Never append an id the feed already lists: a repeated row
+                    // would make indexOf-based navigation cycle between copies.
+                    const iids = appendUniqueIds(action.feed.iids, action.items)
                     return {
                         ...state,
                         [action.feed._id]: {
                             ...action.feed,
                             loading: false,
-                            allLoaded: action.items.length < LOAD_QUANTITY,
-                            iids: [
-                                ...action.feed.iids,
-                                ...action.items.map(i => i._id),
-                            ],
+                            allLoaded: isFeedExhausted(
+                                action.next,
+                                action.carry,
+                                action.items
+                            ),
+                            iids,
+                            next: action.next ?? null,
+                            carry: (action.carry ?? []).map(i => i._id),
+                            readAtCursor: action.readAtCursor ?? 0,
                         },
                     }
+                }
                 case ActionStatus.Failure:
                     return {
                         ...state,

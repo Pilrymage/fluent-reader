@@ -12,7 +12,14 @@ type CardInfoProps = {
 
 const CardInfo: React.FunctionComponent<CardInfoProps> = props => (
     <p className="info">
-        {props.source.iconurl ? <img src={props.source.iconurl} /> : null}
+        {props.source.iconurl ? (
+            <img
+                src={props.source.iconurl}
+                onError={e => {
+                    e.currentTarget.style.display = "none"
+                }}
+            />
+        ) : null}
         <span className="name">
             {props.source.name}
             {props.showCreator && props.item.creator && (
