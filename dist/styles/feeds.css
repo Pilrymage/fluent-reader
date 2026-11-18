@@ -32,7 +32,7 @@
    there). An <iframe> has no author default size, so without this rule it keeps
    the UA default 300x150 and the whole article opens in a stamp. Keep the box
    identical to the webview above: same toolbar offset, no border. */
-.article iframe {
+.article iframe-broken {
     display: block;
     width: 100%;
     height: calc(100% - 36px);
