@@ -28,7 +28,20 @@
     border: none;
     color: var(--black);
 }
-.article webview.error {
+/* The browser build renders the same slot as an <iframe> (no Electron webview
+   there). An <iframe> has no author default size, so without this rule it keeps
+   the UA default 300x150 and the whole article opens in a stamp. Keep the box
+   identical to the webview above: same toolbar offset, no border. */
+.article iframe {
+    display: block;
+    width: 100%;
+    height: calc(100% - 36px);
+    border: none;
+    color: var(--black);
+    min-height: 0;
+}
+.article webview.error,
+.article iframe.error {
     display: none;
 }
 .article i.ms-Icon {
