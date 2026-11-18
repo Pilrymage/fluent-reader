@@ -1,0 +1,113 @@
+name: Custom CI
+
+# The release workflows only run on v* tags and pages.yml only on master, so a
+# push to this branch used to run no CI at all. This workflow covers that gap:
+# build both bundles, then run the whole regression suite.
+#
+# Ordering matters: custom-runtime asserts on dist/electron.js only when the file
+# exists, which is how it proves the production bundle kept the bootstrap.
+# Running the tests before the build would silently skip that assertion.
+on:
+    push:
+        branches:
+            - custom/emacs-reader
+    pull_request:
+        branches:
+            - custom/emacs-reader
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: custom-ci-${{ github.ref }}
+    cancel-in-progress: true
+
+env:
+    # The renderer bundle is large; the default heap is not always enough on a
+    # fresh runner. Kept well under the runner's RAM.
+    NODE_OPTIONS: --max-old-space-size=4096
+
+jobs:
+    build-and-test:
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: "24"
+                  cache: npm
+
+            # postinstall downloads Electron and rebuilds better-sqlite3, neither
+            # of which the bundles need, so skip lifecycle scripts. package-lock
+            # is tracked, which is what makes `npm ci` reproducible here.
+            - name: Install dependencies
+              run: npm ci --ignore-scripts --no-audit --no-fund
+
+            - name: Build Electron bundles
+              run: npm run build
+
+            - name: Build browser bundle
+              run: npm run build:web
+
+            # Every test is a plain node script that exits non-zero on failure.
+            # They run one by one so a failure names the file instead of hiding
+            # inside a single aggregated step.
+            - name: Regression suite
+              run: |
+                  set -uo pipefail
+                  tests=(
+                      keyboard-shortcuts
+                      scroll-geometry
+                      item-shortcuts
+                      card-events
+                      fever-icons
+                      custom-runtime
+                      pending-read-states
+                      feed-first-page
+                      feed-paging
+                      focus-virtualized
+                      network-diagnostics
+                      network-route
+                      network-regressions
+                      fever-network
+                      web-article-frame
+                      static-cache-policy
+                  )
+                  failed=()
+                  for t in "${tests[@]}"; do
+                      if node "tests/$t.cjs"; then
+                          echo "PASS $t"
+                      else
+                          echo "FAIL $t"
+                          failed+=("$t")
+                      fi
+                  done
+                  {
+                      echo "### Regression suite"
+                      echo ""
+                      echo "${#tests[@]} test files, ${#failed[@]} failed"
+                      if [ "${#failed[@]}" -gt 0 ]; then
+                          echo ""
+                          echo "Failed: ${failed[*]}"
+                      fi
+                  } >> "$GITHUB_STEP_SUMMARY"
+                  if [ "${#failed[@]}" -gt 0 ]; then
+                      exit 1
+                  fi
+
+            # The article frame and the cache policy are the two regressions this
+            # branch exists to prevent: assert on the built output as well, not
+            # only on the sources the unit tests read.
+            - name: Verify built artifacts carry the fixes
+              run: |
+                  set -euo pipefail
+                  grep -q '\.article iframe' dist/styles/feeds.css
+                  grep -q 'private, no-cache, must-revalidate' server/src/api.ts
+                  compgen -G 'dist-web/main.*.js' > /dev/null
+                  test -f dist/electron.js
+                  test -f dist/index.js
+                  echo "article frame rule, cache policy and both bundles present"
