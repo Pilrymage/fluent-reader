@@ -303,8 +303,11 @@ const MIME: Record<string, string> = {
  * Serve the browser build from webRoot, then fall back to the Electron dist
  * tree for the checked-in assets (icons/, article/, styles/). Path traversal is
  * rejected by re-checking the resolved prefix against the root.
+ *
+ * Exported so tests/static-cache-policy.cjs can assert the cache headers the
+ * CDN in front of this site depends on.
  */
-async function serveStatic(
+export async function serveStatic(
     pathname: string,
     res: http.ServerResponse,
     config: ServerConfig
@@ -325,11 +328,18 @@ async function serveStatic(
             res.writeHead(200, {
                 "content-type": MIME[ext] ?? "application/octet-stream",
                 "content-length": data.byteLength,
-                // Private: the whole site is behind SSO, so a shared CDN cache
-                // must not hand the bundle to unauthenticated visitors.
+                // Private on BOTH branches, for two different reasons:
+                //  - the whole site is behind SSO, so a shared CDN cache must
+                //    not hand the bundle to unauthenticated visitors;
+                //  - Cloudflare's "Browser Cache TTL" zone setting (14400s here)
+                //    replaces a bare `no-cache` with `max-age=14400` and then
+                //    caches the file at the edge. A deploy would then serve the
+                //    previous version for up to four hours. `private` is what
+                //    makes the edge bypass instead of rewriting. Do not drop it
+                //    from the unhashed branch: no-cache alone is not enough.
                 "cache-control": hashed
                     ? "private, max-age=31536000, immutable"
-                    : "no-cache, must-revalidate",
+                    : "private, no-cache, must-revalidate",
             })
             res.end(data)
             return true

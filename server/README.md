@@ -210,11 +210,30 @@ ingress 快照成 `tunnel-config-*.json`。
 - `/api/health` 仍然匿名（给 Uptime Kuma 用），只暴露条目数、未读数、源数；
   Authelia 侧只对 `^/api/health` 开 bypass。
 - 静态资源（`/`、`/index.js`、`/article/*`）不再是公开文件：`/` 和 `/index.html`
-  由 SSO 保护，带哈希的产物按 immutable 缓存，其余 `no-cache`。
+  由 SSO 保护；带内容哈希的产物按 `private, max-age=31536000, immutable` 发，
+  其余一律 `private, no-cache, must-revalidate`。
+
+### 为什么每一条静态资源都必须带 `private`
+
+`private` 不只是"别让共享缓存发给别人"，它还是**关掉 Cloudflare 改写**的开关。
+本 zone 的 `Browser Cache TTL = 14400`、`cache_level = aggressive`（整站设置，18 个
+域名共用，不能动），实测同一会话 Cookie、只有响应头不同：
+
+| 源站发出 | Cloudflare 返回 | 后果 |
+|---|---|---|
+| `private, max-age=31536000, immutable` | 原样透传，`cf-cache-status: BYPASS` | 正确 |
+| `no-cache, must-revalidate`（**不带 private**） | 改写成 `max-age=14400`，`MISS`/`EXPIRED` | **发版后最多 4 小时仍是旧版** |
+
+所以非哈希资源（`styles/*.css`、`article/*`、`index.css`、`icons/*`）只写 `no-cache`
+是不够的——2026-11-18 就是这样让一份修好的 `feeds.css` 有被边缘缓存 4 小时的风险。
+回归测试 `tests/static-cache-policy.cjs` 直接加载 `serveStatic` 断言这两条分支，
+去掉任何一处 `private` 都会红。
 
 > 部署注意：数据目录默认取 `READER_DB` 的所在目录（`/srv/data/reader`）。代码目录
 > 是 root 所有且 systemd 开了 `ProtectSystem=full`，往那里写 token 会启动失败。
 > 另外 `/api` 在 Authelia 里**不能再 bypass**——去掉 bypass 后 SSO 才覆盖到接口。
+> 备份别放进 `dist/`：那是静态根目录，放进去等于把备份公开出去，放到
+> `/opt/reader-backups/`。
 
 ### 文章正文为什么不走 URL
 
