@@ -25,8 +25,19 @@ function shutdown(code = 0) {
     setTimeout(() => process.exit(code), 5000).unref()
 }
 
-function refresh() {
-    backend.refresh().catch(err => console.error("[refresh] failed:", err))
+async function refresh() {
+    try {
+        await backend.refresh()
+    } catch (err) {
+        console.error("[refresh] failed:", err)
+    }
+    // Miniflux fetches asynchronously after the nudge, so entries trickling
+    // in behind the sweep are caught by the next one.
+    try {
+        await backend.autoRead?.()
+    } catch (err) {
+        console.error("[auto-read] failed:", err)
+    }
 }
 
 process.on("SIGINT", () => shutdown(0))
@@ -40,9 +51,20 @@ server.listen(config.port, config.host, async () => {
     }
 
     if (refreshOnce) {
-        await backend.refresh()
+        await refresh()
         shutdown(0)
         return
+    }
+
+    // The sweep is a data-state operation, not a fetch: it runs at startup
+    // even when the initial Miniflux nudge is skipped.
+    if (backend.autoRead && config.autoReadGroups.length > 0) {
+        console.log(
+            `[auto-read] categories: ${config.autoReadGroups.join(", ")}`
+        )
+        backend
+            .autoRead()
+            .catch(err => console.error("[auto-read] failed:", err))
     }
 
     if (skipInitial) {

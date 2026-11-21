@@ -109,6 +109,7 @@ science.org 对任何 UA 都 403。所以 BFF 自己解析：
 | `READER_REFRESH_MINUTES` | `30` | 刷新间隔（`miniflux` 模式下只是"催一下"） |
 | `READER_CONCURRENCY` / `READER_TIMEOUT_MS` | `4` / `20000` | 仅 `local` 抓取生效 |
 | `READER_CORS_ORIGIN` | `*` | 前端独立域名时收紧 |
+| `READER_AUTO_READ_GROUPS` | — | 逗号分隔的 Miniflux 分类名（如 `外文`）；这些分类的未读会被自动整组标读，见下文 |
 
 ## 实测：local 后端（2026-11-14，本机 Windows，259 源，并发 4）
 
@@ -131,7 +132,28 @@ science.org 对任何 UA 都 403。所以 BFF 自己解析：
 - 缓存只增不减：目前没有按时间或条目数清理，长时间使用需要加一条裁剪策略。
 - `local` 模式无条件 GET（未用 ETag / If-Modified-Since）、无代理支持、无 403 绕过。
 - 无全文提取（Mercury）——`loadFull` 还没搬过来。
-- 「整个源/整组标记已读」按 200 条一页取未读，单源未读超过 200 时要再点一次。
+- ~~「整个源/整组标记已读」按 200 条一页取未读，单源未读超过 200 时要再点一次~~
+  已修复：`markSourcesRead` 现在按 100 条一页循环清空，直到该源未读耗尽（回归见 `tests/server-auto-read.cjs`）。
+
+## 分类自动标读（filter）
+
+「内容太多看不完」的对策：把不想读的分类配进 `READER_AUTO_READ_GROUPS`（逗号分隔的
+Miniflux 分类名，如 `外文`），BFF 在**每次刷新后、每次启动时**把该分类下所有未读条目
+整组标读（写回 Miniflux，对所有客户端生效）。效果是该分类的未读数永远 ≈ 0，未读列表
+里只剩你想读的分类。
+
+- 分类按**标题**匹配，每轮重新解析：往分类里加新订阅源、改名、移动源都会自动跟进；
+  gid 只是 `1000000 + 分类 id`，不参与匹配。
+- 执行时机：启动后一轮（`--no-initial-refresh` 也会跑，这是数据操作不是抓取）、
+  每 `READER_REFRESH_MINUTES` 刷新后、网页里点刷新（`POST /api/refresh`）后的后台。
+- 标读不可逆（写进 Miniflux 的状态），但条目本身不删：「全部文章」视图里仍能翻到，
+  只是不再以未读出现。星标过的条目照常保留星标。
+- 内部实现在 `backend.ts` 的 `drainFeedUnread(sid, keep)`：按 100 条一页循环抽干，
+  `keep` 是判定谓词——现在是恒真（整组标读）。**要按关键词精细过滤时**（如只滤
+  标题含某词的外文条目），换一个基于标题/作者正则的 `keep` 即可，循环、分页与游标
+  逻辑不变；后续可挂 `READER_AUTO_READ_RULES=分类:正则` 之类的配置。
+- 2026-11-21 起 arm-main 的 `reader.env` 配置为 `READER_AUTO_READ_GROUPS=外文`
+  （中文 19 源、翻译 120 源保持原样）。
 
 ## 部署到 arm-main（2026-11-15 已落地）
 

@@ -259,11 +259,16 @@ export function createApiServer(config: ServerConfig, backend: ReaderBackend) {
 
             if (url.pathname === "/api/refresh" && req.method === "POST") {
                 const limit = url.searchParams.get("limit")
-                json(
-                    res,
-                    202,
-                    await backend.refresh(limit ? Number(limit) : undefined)
+                const result = await backend.refresh(
+                    limit ? Number(limit) : undefined
                 )
+                // The sweep runs behind the response: draining a whole
+                // category can take minutes, and the client reloads its feeds
+                // immediately after this returns.
+                void backend
+                    .autoRead?.()
+                    .catch(err => console.error("[auto-read] failed:", err))
+                json(res, 202, result)
                 return
             }
 

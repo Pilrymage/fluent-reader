@@ -1,9 +1,12 @@
 import http from "node:http"
 
-// Minimal Miniflux stand-in for end-to-end tests of the reader-server contract.
-// It records every mutating call so a test can assert the read/star write-through.
+// Minimal Miniflux stand-in for tests of the reader-server contract. Unlike a
+// plain recorder it MUTATES entry state like the real thing — PUT /v1/entries
+// flips statuses — so paging and draining loops can be exercised end to end.
+// Every mutating call is still recorded on /__calls for assertions.
 
-const calls = []
+const calls: { method: string; body?: unknown }[] = []
+
 const feeds = [
     {
         id: 1,
@@ -11,6 +14,7 @@ const feeds = [
         feed_url: "https://one.example/rss",
         site_url: "https://one.example",
         icon: { icon_id: 7 },
+        category: { id: 11, title: "中文" },
     },
     {
         id: 2,
@@ -18,10 +22,31 @@ const feeds = [
         feed_url: "http://127.0.0.1:18082/rss/abc",
         site_url: "https://two.example",
         icon: null,
+        category: { id: 12, title: "外文" },
+    },
+    {
+        id: 3,
+        title: "Feed Three",
+        feed_url: "https://three.example/rss",
+        site_url: "https://three.example",
+        icon: null,
+        category: { id: 12, title: "外文" },
     },
 ]
 
-const entries = [
+interface StubEntry {
+    id: number
+    feed_id: number
+    title: string
+    url: string
+    published_at: string
+    content: string
+    author: string
+    status: string
+    starred: boolean
+}
+
+const entries: StubEntry[] = [
     {
         id: 101,
         feed_id: 1,
@@ -56,6 +81,32 @@ const entries = [
         starred: false,
     },
 ]
+// A backlog larger than one page, so draining loops must page to finish.
+for (let i = 0; i < 250; i += 1) {
+    entries.push({
+        id: 300 + i,
+        feed_id: 3,
+        title: `Article ${i + 1}`,
+        url: `https://three.example/a/${i + 1}`,
+        published_at: "2026-11-10T02:00:00Z",
+        content: "<p>Body</p>",
+        author: "",
+        status: "unread",
+        starred: false,
+    })
+}
+
+// Miniflux names these "reads"/"unreads"; the BFF reads .unreads.
+function counters() {
+    const reads: Record<string, number> = {}
+    const unreads: Record<string, number> = {}
+    for (const entry of entries) {
+        const map = entry.status === "unread" ? unreads : reads
+        const key = String(entry.feed_id)
+        map[key] = (map[key] ?? 0) + 1
+    }
+    return { reads, unreads }
+}
 
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost")
@@ -70,10 +121,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/v1/feeds" && req.method === "GET")
         return send(200, feeds)
     if (url.pathname === "/v1/feeds/counters") {
-        return send(200, {
-            unread: { "1": 1, "2": 1 },
-            read: { "1": 1, "2": 0 },
-        })
+        return send(200, counters())
     }
     if (url.pathname === "/v1/feeds/refresh" && req.method === "PUT") {
         calls.push({ method: "refresh" })
@@ -91,7 +139,7 @@ const server = http.createServer(async (req, res) => {
         const starred = url.searchParams.get("starred")
         const offset = Number(url.searchParams.get("offset") ?? 0)
         const limit = Number(url.searchParams.get("limit") ?? 50)
-        let rows = entries
+        let rows: StubEntry[] = entries
         if (feedId) rows = rows.filter(e => e.feed_id === Number(feedId))
         if (status) rows = rows.filter(e => e.status === status)
         if (starred) rows = rows.filter(e => e.starred)
@@ -103,7 +151,12 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/v1/entries" && req.method === "PUT") {
         let body = ""
         for await (const chunk of req) body += chunk
-        calls.push({ method: "setStatus", body: JSON.parse(body) })
+        const payload = JSON.parse(body)
+        calls.push({ method: "setStatus", body: payload })
+        for (const entry of entries) {
+            if (payload.entry_ids.includes(entry.id))
+                entry.status = payload.status
+        }
         res.writeHead(204).end()
         return
     }
@@ -112,6 +165,10 @@ const server = http.createServer(async (req, res) => {
         req.method === "PUT"
     ) {
         calls.push({ method: "bookmark", path: url.pathname })
+        const id = Number(url.pathname.split("/")[3])
+        for (const entry of entries) {
+            if (entry.id === id) entry.starred = !entry.starred
+        }
         res.writeHead(204).end()
         return
     }
@@ -120,5 +177,9 @@ const server = http.createServer(async (req, res) => {
     send(404, { error: "not found", path: url.pathname })
 })
 
-const port = Number(process.argv[2] ?? 17555)
-server.listen(port, "127.0.0.1", () => console.log(`stub miniflux on ${port}`))
+const port = Number(process.argv[2] ?? 0)
+server.listen(port, "127.0.0.1", () => {
+    const address = server.address()
+    const actual = typeof address === "object" && address ? address.port : port
+    console.log(`stub miniflux on ${actual}`)
+})

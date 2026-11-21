@@ -82,6 +82,10 @@ export interface ReaderBackend {
     ): Promise<void>
     markSourcesRead(sids: number[]): Promise<void>
     refresh(limit?: number): Promise<unknown>
+    /** The category auto-read filter (READER_AUTO_READ_GROUPS): marks every
+     *  unread entry of the listed categories read. Absent on backends that
+     *  have no categories. */
+    autoRead?(): Promise<{ groups: number; entries: number }>
     stats(): Promise<{
         items: number
         unread: number
@@ -93,6 +97,16 @@ export interface ReaderBackend {
 
 const clamp = (value: number | undefined, fallback: number) =>
     Math.min(Math.max(value ?? fallback, 1), 200)
+
+/** Miniflux serves full pages of this size; a page shorter than the request
+ *  only ever means the listing is exhausted. */
+const UNREAD_PAGE_SIZE = 100
+
+/** One feed's sweep stops after this many pages even if unread entries
+ *  remain, so a pathological feed cannot wedge the sweep; the next sweep
+ *  continues where this one stopped. 200 pages × 100 entries is far past any
+ *  real backlog. */
+const MAX_SWEEP_PAGES = 200
 
 /* ------------------------------------------------------------------ *
  * Miniflux backend: Miniflux stays the only fetcher and store. This
@@ -276,7 +290,74 @@ function createMinifluxBackend(config: ServerConfig): ReaderBackend {
         }
     }
 
-    return {
+    /**
+     * Drain one feed's unread entries, marking read those the predicate keeps.
+     *
+     * The unread listing shrinks as entries are marked, so the cursor advances
+     * only over entries left unread; a page shorter than the request or an
+     * empty page ends the loop. `keep` is the extension point for
+     * keyword-level filters: today every caller passes `() => true` to mark
+     * the whole category, a future rule engine can pass a title/author test
+     * and the same loop marks selectively without skipping anything.
+     */
+    async function drainFeedUnread(
+        sid: number,
+        keep: (entry: MinifluxEntry) => boolean = () => true,
+        maxPages: number = MAX_SWEEP_PAGES
+    ): Promise<number> {
+        let marked = 0
+        let offset = 0
+        for (let page = 0; page < maxPages; page += 1) {
+            const pending = await client.entries({
+                feed_id: sid,
+                status: "unread",
+                limit: UNREAD_PAGE_SIZE,
+                offset,
+            })
+            if (pending.entries.length === 0) break
+            const kept = pending.entries.filter(keep)
+            if (kept.length > 0) {
+                await client.setStatus(
+                    kept.map(entry => entry.id),
+                    "read"
+                )
+                marked += kept.length
+            }
+            offset += pending.entries.length - kept.length
+            if (pending.entries.length < UNREAD_PAGE_SIZE) break
+        }
+        return marked
+    }
+
+    /** Mark every unread entry of these feeds read. Feeds drain in a small
+     *  worker pool; one feed failing does not stop the others. Returns how
+     *  many entries were marked. */
+    async function markFeedsRead(sids: number[]): Promise<number> {
+        const queue = [...sids]
+        let marked = 0
+        const runners = Array.from(
+            { length: Math.min(6, queue.length) },
+            async () => {
+                while (queue.length > 0) {
+                    const sid = queue.shift()
+                    if (sid === undefined) break
+                    try {
+                        marked += await drainFeedUnread(sid)
+                        markSourceRead(sid)
+                    } catch (err) {
+                        console.error(
+                            `[markSourcesRead] feed ${sid}:`,
+                            err instanceof Error ? err.message : err
+                        )
+                    }
+                }
+            }
+        )
+        await Promise.all(runners)
+        return marked
+    }
+
+    const backend: ReaderBackend = {
         kind: "miniflux",
         async sources() {
             const [list, counters] = await Promise.all([
@@ -381,36 +462,9 @@ function createMinifluxBackend(config: ServerConfig): ReaderBackend {
             }
         },
         async markSourcesRead(sids) {
-            const queue = [...sids]
-            const runners = Array.from(
-                { length: Math.min(6, queue.length) },
-                async () => {
-                    while (queue.length > 0) {
-                        const sid = queue.shift()
-                        if (sid === undefined) break
-                        try {
-                            const pending = await client.entries({
-                                feed_id: sid,
-                                status: "unread",
-                                limit: 200,
-                            })
-                            if (pending.entries.length > 0) {
-                                await client.setStatus(
-                                    pending.entries.map(entry => entry.id),
-                                    "read"
-                                )
-                            }
-                            markSourceRead(sid)
-                        } catch (err) {
-                            console.error(
-                                `[markSourcesRead] feed ${sid}:`,
-                                err instanceof Error ? err.message : err
-                            )
-                        }
-                    }
-                }
-            )
-            await Promise.all(runners)
+            // One request per feed used to leave any backlog past the first
+            // 200 unread in place; the drain loops until the feed is empty.
+            await markFeedsRead(sids)
         },
         async refresh() {
             if (refreshing) return { started: false }
@@ -422,6 +476,31 @@ function createMinifluxBackend(config: ServerConfig): ReaderBackend {
             } finally {
                 refreshing = false
             }
+        },
+        /**
+         * The category auto-read filter (READER_AUTO_READ_GROUPS): after every
+         * refresh, every unread entry of the listed categories is marked read
+         * in Miniflux, so those articles never surface as unread on any
+         * client. Categories are matched by title each sweep, so feeds moved
+         * into a listed category start filtering automatically.
+         */
+        async autoRead() {
+            const names = config.autoReadGroups
+            if (names.length === 0) return { groups: 0, entries: 0 }
+            const groups = await backend.groups()
+            const targets = groups.filter(group => names.includes(group.name))
+            let entries = 0
+            for (const group of targets) {
+                entries += await markFeedsRead(group.sids)
+            }
+            if (targets.length > 0 && entries > 0) {
+                console.log(
+                    `[auto-read] ${targets
+                        .map(group => group.name)
+                        .join(", ")}: ${entries} unread marked read`
+                )
+            }
+            return { groups: targets.length, entries }
         },
         async stats() {
             const counters = await client.counters()
@@ -456,6 +535,7 @@ function createMinifluxBackend(config: ServerConfig): ReaderBackend {
             return icon ?? letterIcon(feed.title, sid)
         },
     }
+    return backend
 }
 
 /* ------------------------------------------------------------------ *

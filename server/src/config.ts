@@ -20,6 +20,9 @@ export interface ServerConfig {
     concurrency: number
     fetchTimeoutMs: number
     corsOrigin: string
+    /** Miniflux category titles whose unread entries are always marked read
+     *  (the category-level filter). Empty disables the sweep. */
+    autoReadGroups: string[]
 }
 
 export const SERVER_ROOT = path.resolve(import.meta.dirname, "..")
@@ -42,6 +45,15 @@ function numberFromEnv(name: string, fallback: number): number {
     if (!raw) return fallback
     const value = Number(raw)
     return Number.isFinite(value) && value > 0 ? value : fallback
+}
+
+function listFromEnv(name: string): string[] {
+    const raw = process.env[name]
+    if (!raw) return []
+    return raw
+        .split(",")
+        .map(value => value.trim())
+        .filter(Boolean)
 }
 
 /**
@@ -98,5 +110,6 @@ export function loadConfig(): ServerConfig & { tokenGenerated: boolean } {
         concurrency: numberFromEnv("READER_CONCURRENCY", 4),
         fetchTimeoutMs: numberFromEnv("READER_TIMEOUT_MS", 20000),
         corsOrigin: process.env.READER_CORS_ORIGIN ?? "*",
+        autoReadGroups: listFromEnv("READER_AUTO_READ_GROUPS"),
     }
 }

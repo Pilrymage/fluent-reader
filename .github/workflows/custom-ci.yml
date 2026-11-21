@@ -76,6 +76,7 @@ jobs:
                       fever-network
                       web-article-frame
                       static-cache-policy
+                      server-auto-read
                   )
                   failed=()
                   for t in "${tests[@]}"; do
