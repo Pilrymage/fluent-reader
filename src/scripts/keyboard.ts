@@ -73,12 +73,20 @@ function requiresShiftForBinding(binding: string): boolean {
 export type ShortcutAppState = {
     settings?: { display?: boolean }
     contextMenu?: { type?: number }
+    logMenu?: { display?: boolean }
 }
 
 export function isOverlayOpen(app: ShortcutAppState): boolean {
     if (!app) return false
     if (app.settings && app.settings.display) return true
     return Boolean(app.contextMenu && (app.contextMenu.type || 0) !== 0)
+}
+
+// The notifications callout is only an overlay for keys that would move focus
+// away from it; card shortcuts keep their existing behaviour.
+export function isFocusStealingOverlayOpen(app: ShortcutAppState): boolean {
+    if (isOverlayOpen(app)) return true
+    return Boolean(app && app.logMenu && app.logMenu.display)
 }
 
 export function isWebviewActive(activeElement): boolean {
@@ -127,7 +135,56 @@ export function getCardShortcutAction(
     return null
 }
 
-// `b` pressed on the open article's own controls, such as its toolbar. Keys
+function isMenuTreeTarget(target): boolean {
+    if (!target || typeof (target as any).closest !== "function") return false
+    return Boolean((target as any).closest('[role="tree"], [role="treeitem"]'))
+}
+
+export const LIST_FOCUS_KEY = "a"
+
+// `a` jumps back to the article list, so unlike the list movement keys it also
+// works while the open article (its webview/iframe) holds focus — that is the
+// point of the key. It stays inert wherever the letter must be typed: inputs,
+// the sources tree (which uses letters for type-ahead) and overlay panels.
+export function getListFocusShortcut(
+    e,
+    app: ShortcutAppState,
+    activeElement = null
+): "focusList" | null {
+    if (!e) return null
+    if (isComposingEvent(e) || hasModifier(e)) return null
+    if (String(e.key || "").toLowerCase() !== LIST_FOCUS_KEY) return null
+    if (isEditableTarget(e.target) || isEditableTarget(activeElement)) {
+        return null
+    }
+    if (isFocusStealingOverlayOpen(app)) return null
+    if (isMenuTreeTarget(e.target) || isMenuTreeTarget(activeElement)) {
+        return null
+    }
+    return "focusList"
+}
+
+// The row `a` should land on: the row focus is already on (nothing to do), then
+// the article that is open, then the row the keyboard cursor last sat on, then
+// the first row of the list.
+export function pickListFocusId(
+    iids: number[],
+    preferred: (number | null | undefined)[] = []
+): number | null {
+    if (!Array.isArray(iids) || iids.length === 0) return null
+    for (const candidate of preferred) {
+        if (
+            candidate !== null &&
+            candidate !== undefined &&
+            iids.includes(candidate)
+        ) {
+            return candidate
+        }
+    }
+    return iids[0]
+}
+
+// "b" pressed on the open article's own controls, such as its toolbar. Keys
 // typed into the article's webview reach the renderer through the main
 // process instead.
 export function isArticleOpenExternalKey(e): boolean {
@@ -487,6 +544,28 @@ export function computeDirectionalScrollTop(
             ? cardTop - topInset
             : cardTop + cardHeight - clientHeight
     return clampScroll(target, maxScrollTop)
+}
+
+// Minimal scroll that makes a row fully visible again, keeping the container
+// still when the row is already on screen. Jumping to the list must not yank
+// the reader's position the way a directional page step would.
+export function computeRevealScrollTop(
+    cardTop: number,
+    cardHeight: number,
+    scrollTop: number,
+    clientHeight: number,
+    topInset: number,
+    maxScrollTop: number
+): number {
+    const visibleTop = scrollTop + topInset
+    const visibleBottom = scrollTop + clientHeight
+    if (cardTop < visibleTop) {
+        return clampScroll(cardTop - topInset, maxScrollTop)
+    }
+    if (cardTop + cardHeight > visibleBottom) {
+        return clampScroll(cardTop + cardHeight - clientHeight, maxScrollTop)
+    }
+    return clampScroll(scrollTop, maxScrollTop)
 }
 
 export function computeCycleScrollTop(

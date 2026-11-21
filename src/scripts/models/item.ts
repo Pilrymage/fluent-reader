@@ -23,7 +23,9 @@ import { queueReadState } from "./net/read-queue"
 import { RSSFeed, initFeedSuccess } from "./feed"
 import {
     getCardShortcutAction,
+    getListFocusShortcut,
     getNextItemId,
+    pickListFocusId,
     pickNextAfterRemoval,
     planMarkReadStep,
     navigationStillValid,
@@ -36,6 +38,7 @@ import {
     resetPositionCycle,
     computeDirectionalScrollTop,
     computeCycleScrollTop,
+    computeRevealScrollTop,
     measureVisibleTopInset,
     ScrollMode,
     FocusPosition,
@@ -545,7 +548,10 @@ let lastFeedId: string | number | null = null
 let focusGeneration = 0
 const markReadQueue = new StepQueue()
 
-type FocusScrollIntent = { mode: ScrollMode } | { position: FocusPosition }
+type FocusScrollIntent =
+    | { mode: ScrollMode }
+    | { position: FocusPosition }
+    | { reveal: true }
 
 type ShortcutState = {
     page?: {
@@ -620,26 +626,37 @@ function scrollCardIntoPlace(target: HTMLElement, intent: FocusScrollIntent) {
         0,
         container.scrollHeight - container.clientHeight
     )
-    const nextTop =
-        "position" in intent
-            ? computeCycleScrollTop(
-                  intent.position,
-                  cardTop,
-                  cardHeight,
-                  container.scrollTop,
-                  container.clientHeight,
-                  topInset,
-                  maxScrollTop
-              )
-            : computeDirectionalScrollTop(
-                  cardTop,
-                  cardHeight,
-                  container.scrollTop,
-                  container.clientHeight,
-                  topInset,
-                  maxScrollTop,
-                  intent.mode
-              )
+    let nextTop: number
+    if ("position" in intent) {
+        nextTop = computeCycleScrollTop(
+            intent.position,
+            cardTop,
+            cardHeight,
+            container.scrollTop,
+            container.clientHeight,
+            topInset,
+            maxScrollTop
+        )
+    } else if ("reveal" in intent) {
+        nextTop = computeRevealScrollTop(
+            cardTop,
+            cardHeight,
+            container.scrollTop,
+            container.clientHeight,
+            topInset,
+            maxScrollTop
+        )
+    } else {
+        nextTop = computeDirectionalScrollTop(
+            cardTop,
+            cardHeight,
+            container.scrollTop,
+            container.clientHeight,
+            topInset,
+            maxScrollTop,
+            intent.mode
+        )
+    }
     container.scrollTop = nextTop
 }
 
@@ -823,6 +840,67 @@ export function noteCardFocus(id: number | null): void {
 
 export function whenMarkReadQueueIdle(): Promise<void> {
     return markReadQueue.whenIdle()
+}
+
+// The article overlay is a FocusTrapZone: a row focused while it is still
+// mounted is pulled straight back into the article, so a jump to the list has to
+// wait for the trap to go away (one commit after the dismiss dispatch). If it
+// never goes away, leave the article's focus alone rather than fight the trap.
+const FOCUS_TRAP_SETTLE_TIMEOUT = 500
+
+function hasArticleFocusTrap(): boolean {
+    if (typeof document === "undefined" || !document.querySelector) return false
+    return Boolean(document.querySelector(".article-container"))
+}
+
+function focusListItem(getState: () => any, openId: number | null) {
+    const state: ShortcutState = getState()
+    if (!state || !state.page) return
+    // Already on a row of this list (the key was pressed from the list itself,
+    // or focus never left it): keep the reader where they are.
+    const activeId = getActiveCardId()
+    const feed = state.feeds ? state.feeds[state.page.feedId] : null
+    const iids: number[] = feed && Array.isArray(feed.iids) ? feed.iids : []
+    const targetId = pickListFocusId(iids, [activeId, openId, keyboardFocusId])
+    if (targetId === null) return
+    keyboardFocusId = targetId
+    if (targetId === activeId) {
+        // No focus move, but a row the virtualized list recycled still needs to
+        // be brought back into view.
+        const card = document.querySelector(
+            `[data-iid="${targetId}"]`
+        ) as HTMLElement | null
+        if (card) scrollCardIntoPlace(card, { reveal: true })
+        return
+    }
+    focusCardWhenReady(getState, targetId, { reveal: true })
+}
+
+function focusListItemWhenReady(
+    getState: () => any,
+    openId: number | null,
+    deadline = Date.now() + FOCUS_TRAP_SETTLE_TIMEOUT
+) {
+    if (hasArticleFocusTrap()) {
+        if (Date.now() >= deadline) return
+        scheduleFocusAttempt(() =>
+            focusListItemWhenReady(getState, openId, deadline)
+        )
+        return
+    }
+    focusListItem(getState, openId)
+}
+
+/**
+ * `a`: bring the keyboard to the article list without pressing Tab.
+ *
+ * Lands on `openId` (the article that was just open), else the row the cursor
+ * last sat on, else the first row, and only scrolls when that row is off screen.
+ */
+export function focusArticleList(openId: number | null = null): AppThunk<void> {
+    return (_dispatch, getState) => {
+        focusListItemWhenReady(getState, openId)
+    }
 }
 
 function enqueueMarkReadAndNext(

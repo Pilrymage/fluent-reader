@@ -7,9 +7,19 @@ profile.mkdir(exist_ok=True)
 config={'useNeDB':False,'version':'1.3.1-custom.1','dbVersion':'sqlite','serviceConfigs':{'type':0},'sourceGroups':[{'gid':0,'isMultiple':True,'sids':[101,102],'name':'PATCH TEST GROUP','expanded':True},{'gid':1,'isMultiple':False,'sids':[103]}],'menuOn':True,'view':3,'theme':'light','filterType':19,'fetchInterval':0,'pacOn':False,'nextGroupId':2,'sourceRules':{},'locale':'en-US'}
 (profile/'config.json').write_text(json.dumps(config),encoding='utf-8')
 db=profile/'fluent-reader.db'
+def unlink_when_released(p):
+ # A just-terminated instance may still hold the SQLite handle for a moment.
+ for _ in range(100):
+  try:
+   p.unlink()
+   return
+  except FileNotFoundError:
+   return
+  except PermissionError:
+   time.sleep(.1)
+ raise SystemExit('database file still locked after 10s: '+str(p))
 for ext in ['', '-wal', '-shm']:
- p=Path(str(db)+ext)
- if p.exists(): p.unlink()
+ unlink_when_released(Path(str(db)+ext))
 c=sqlite3.connect(db)
 journal=json.loads((REPO/'dist/drizzle/meta/_journal.json').read_text())
 c.execute('CREATE TABLE __drizzle_migrations (id SERIAL PRIMARY KEY, hash text NOT NULL, created_at numeric)')

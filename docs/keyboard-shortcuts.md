@@ -6,6 +6,7 @@ context menus/modals, and `<webview>` elements.
 
 | Key | Action |
 | --- | --- |
+| `a` | Jump the keyboard to the article list without pressing `Tab`. Lands on the open article's row, else the row the cursor last sat on, else the first row, and scrolls only as far as needed to make that row visible. In the card views the open article is a focus trap over the list, so `a` closes it first. It works while the open article's webview/iframe holds focus, and stays inert in inputs, settings/menus, and the sources tree (which uses letters for type-ahead). |
 | `r` | Mark the focused article read and move to the next title. Never toggles and never opens the article. Holding `r` repeats one row at a time. At the last loaded row it loads the next page once, then focuses the first new row; at the true end it clamps without wrapping. |
 | `p` / `ArrowUp` | Move focus up without marking read. |
 | `n` / `ArrowDown` | Move focus down without marking read. |
@@ -22,6 +23,11 @@ Movement and cycling set the `#refocus` container's `scrollTop` and focus with
 - Moving up past the viewport top aligns the new row to the bottom of the
   visible area.
 - Scroll offsets always clamp to `[0, scrollHeight - clientHeight]`.
+
+`a` uses neither alignment: it keeps the container still when the target row is
+already visible, and otherwise scrolls the minimum distance to bring the row
+back inside the viewport (top edge to the visible top, bottom edge to the
+visible bottom).
 
 ## Existing shortcuts
 

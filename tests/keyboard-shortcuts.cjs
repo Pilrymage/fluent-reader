@@ -381,8 +381,107 @@ test("cancelPending drops a backlog but lets the in-flight step finish", async (
     assert.deepEqual(seen, [1])
 })
 
-test("Ctrl+L cycle applies center, top, bottom, then center again", () => {
+test("a jumps to the list even while the open article holds focus", () => {
     const kb = load("src/scripts/keyboard.ts")
+    assert.equal(
+        kb.getListFocusShortcut(
+            keyEvent({ key: "a", target: element("DIV", "article") }),
+            appState()
+        ),
+        "focusList"
+    )
+    // Caps Lock reports "A" without Shift.
+    assert.equal(
+        kb.getListFocusShortcut(
+            keyEvent({ key: "A", target: element("DIV", "main") }),
+            appState()
+        ),
+        "focusList"
+    )
+    // The webview/iframe holds focus while the article is open; that is exactly
+    // where a has to work, unlike r/p/n.
+    assert.equal(
+        kb.getListFocusShortcut(
+            keyEvent({ key: "a" }),
+            appState(),
+            element("WEBVIEW", "")
+        ),
+        "focusList"
+    )
+})
+
+test("a stays inert where the letter must be typed or belongs to another widget", () => {
+    const kb = load("src/scripts/keyboard.ts")
+    const tree = {
+        tagName: "DIV",
+        isContentEditable: false,
+        closest: selector =>
+            /role="tree"/.test(selector) ? { tagName: "DIV" } : null,
+    }
+    const inert = [
+        keyEvent({ key: "a", ctrlKey: true }),
+        keyEvent({ key: "a", altKey: true }),
+        keyEvent({ key: "a", metaKey: true }),
+        keyEvent({ key: "a", isComposing: true }),
+        keyEvent({ key: "a", isComposing: false, keyCode: 229 }),
+        keyEvent({ key: "a", target: element("INPUT", "") }),
+        keyEvent({ key: "a", target: element("TEXTAREA", "") }),
+        keyEvent({ key: "a", target: tree }),
+        keyEvent({ key: "r" }),
+    ]
+    for (const e of inert) {
+        assert.equal(kb.getListFocusShortcut(e, appState()), null)
+    }
+    // A selected tree entry keeps its type-ahead.
+    assert.equal(
+        kb.getListFocusShortcut(keyEvent({ key: "a" }), appState(), tree),
+        null
+    )
+    assert.equal(
+        kb.getListFocusShortcut(
+            keyEvent({ key: "a" }),
+            appState({ settings: { display: true } })
+        ),
+        null
+    )
+    assert.equal(
+        kb.getListFocusShortcut(
+            keyEvent({ key: "a" }),
+            appState({ contextMenu: { type: 2 } })
+        ),
+        null
+    )
+    // The notifications callout is only an overlay for keys that would move
+    // focus away from it.
+    assert.equal(
+        kb.getListFocusShortcut(
+            keyEvent({ key: "a" }),
+            appState({ logMenu: { display: true } })
+        ),
+        null
+    )
+    assert.equal(
+        kb.getCardShortcutAction(
+            keyEvent({ target: card("list-card") }),
+            appState({ logMenu: { display: true } })
+        ),
+        "markReadAndNext"
+    )
+})
+
+test("a lands on the open article, then the cursor, then the first row", () => {
+    const kb = load("src/scripts/keyboard.ts")
+    assert.equal(kb.pickListFocusId([10, 11, 12], [11, 10]), 11)
+    assert.equal(kb.pickListFocusId([10, 11, 12], [null, 12]), 12)
+    assert.equal(kb.pickListFocusId([10, 11, 12], [null, null]), 10)
+    // A row that is no longer in the view (filter/category change) is skipped.
+    assert.equal(kb.pickListFocusId([10, 11], [99, 11]), 11)
+    assert.equal(kb.pickListFocusId([10, 11], [99, 98]), 10)
+    assert.equal(kb.pickListFocusId([], [10, 11]), null)
+    assert.equal(kb.pickListFocusId(null, [10, 11]), null)
+})
+
+test("Ctrl+L cycle applies center, top, bottom, then center again", () => {    const kb = load("src/scripts/keyboard.ts")
     const cycle = new kb.FocusPositionCycle()
     assert.equal(cycle.current, "center")
     assert.equal(cycle.applyCurrent(), "center")

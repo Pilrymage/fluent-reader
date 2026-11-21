@@ -11,6 +11,7 @@ import {
     cancelPendingMarkRead,
     noteCardFocus,
     resetItemShortcutState,
+    focusArticleList,
 } from "../scripts/models/item"
 import {
     makeStyles,
@@ -24,10 +25,11 @@ import {
     openViewMenu,
     openMarkAllMenu,
 } from "../scripts/models/app"
-import { toggleSearch } from "../scripts/models/page"
+import { toggleSearch, dismissItem } from "../scripts/models/page"
 import { ViewType, WindowStateListenerType } from "../schema-types"
 import {
     getGlobalShortcutAction,
+    getListFocusShortcut,
     HeldKeyTracker,
     resetPositionCycle,
 } from "../scripts/keyboard"
@@ -85,6 +87,7 @@ const Nav: React.FC = () => {
         (state: RootState) =>
             state.page.itemId && state.page.viewType !== ViewType.List
     )
+    const itemId = useSelector((state: RootState) => state.page.itemId)
     const [maximized, setMaximized] = useState(globalThis.utils.isMaximized())
     const isWideScreen = useIsWideScreen()
     const isBlurred = useIsBlurred()
@@ -156,9 +159,29 @@ const Nav: React.FC = () => {
         }
     }, [state.contextMenu.event, dispatch])
 
+    const focusList = useCallback(() => {
+        // In the card views the article is a focus trap layered over the list;
+        // leaving it mounted would pull the focused row straight back out.
+        const openId = itemId ?? null
+        if (itemShown) dispatch(dismissItem())
+        dispatch(focusArticleList(openId))
+    }, [dispatch, itemShown, itemId])
+
     const navShortcutsHandler = useCallback(
         (e: KeyboardEvent | IObjectWithKey) => {
             if (!state.settings.display) {
+                if (
+                    !(e as KeyboardEvent).repeat &&
+                    getListFocusShortcut(
+                        e as KeyboardEvent,
+                        state,
+                        document.activeElement
+                    ) === "focusList"
+                ) {
+                    ;(e as KeyboardEvent).preventDefault()
+                    focusList()
+                    return
+                }
                 switch (e.key) {
                     case "F1":
                         menu()
@@ -199,7 +222,9 @@ const Nav: React.FC = () => {
         [
             state.settings.display,
             state.contextMenu.type,
+            state.logMenu.display,
             itemShown,
+            itemId,
             menu,
             search,
             fetch,
@@ -207,6 +232,7 @@ const Nav: React.FC = () => {
             logs,
             views,
             settings,
+            focusList,
         ]
     )
 

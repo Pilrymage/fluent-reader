@@ -49,6 +49,7 @@ function makeHarness(options = {}) {
         queuedReads: [],
         readBatches: [],
         markedSources: [],
+        articleTrap: Boolean(options.articleTrap),
     }
     const feedId = options.feedId || "ALL"
     const iids = options.iids || [1, 2, 3]
@@ -156,10 +157,14 @@ function makeHarness(options = {}) {
         getElementById: id => (id === "refocus" ? container : null),
         querySelector(selector) {
             if (selector === "nav") return nav
+            if (selector === ".article-container") {
+                return env.articleTrap ? { className: "article-container" } : null
+            }
             const match = /^\[data-iid="(\d+)"\]$/.exec(selector)
             if (match) return cards.get(Number(match[1])) || null
             return null
         },
+        querySelectorAll: () => [],
         addEventListener() {},
         removeEventListener() {},
     }
@@ -682,6 +687,116 @@ test("web mode marks a whole group read in one request", async () => {
     env.web = true
     await env.dispatch(env.itemMod.markAllRead([7, 8]))
     assert.deepEqual(env.markedSources, [7, 8])
+})
+
+test("a focuses the open article's row without marking or scrolling", async () => {
+    const env = makeHarness({ iids: [1, 2, 3], offsets: { 2: 1000 } })
+    env.state.page.itemId = 2
+    await env.dispatch(env.itemMod.focusArticleList(2))
+    assert.equal(env.document.activeElement.id, 2)
+    // Row 2 at 1000 is off screen with height 100 in a 600px viewport.
+    assert.equal(env.container.scrollTop, 500)
+    assert.deepEqual(env.focusedIds, [2])
+    assert.equal(env.state.items[2].hasRead, false)
+})
+
+test("a leaves an already visible row and the scroll position untouched", async () => {
+    const env = makeHarness({ iids: [1, 2, 3], offsets: { 2: 200 } })
+    env.container.scrollTop = 0
+    await env.dispatch(env.itemMod.focusArticleList(2))
+    assert.equal(env.document.activeElement.id, 2)
+    assert.equal(env.container.scrollTop, 0)
+})
+
+test("a falls back to the walk cursor, then to the first row", async () => {
+    const env = makeHarness({ iids: [1, 2, 3] })
+    env.document.activeElement = env.cards.get(3)
+    await press(
+        env,
+        env.state.items[3],
+        keyEvent({ key: "n", target: cardTarget(env.cards.get(3)) })
+    )
+    await settle()
+    assert.equal(env.document.activeElement.id, 3)
+    // No article open: the cursor row wins over the first row.
+    await env.dispatch(env.itemMod.focusArticleList(null))
+    assert.equal(env.document.activeElement.id, 3)
+    // Cursor and DOM focus gone (category switch): the first row.
+    env.document.activeElement = null
+    env.itemMod.resetItemShortcutState()
+    await env.dispatch(env.itemMod.focusArticleList(null))
+    assert.equal(env.document.activeElement.id, 1)
+})
+
+test("a skips rows the current view no longer shows", async () => {
+    const env = makeHarness({ iids: [10, 11] })
+    await env.dispatch(env.itemMod.focusArticleList(99))
+    assert.equal(env.document.activeElement.id, 10)
+})
+
+test("a waits for the article focus trap to unmount before focusing", async () => {
+    const env = makeHarness({
+        iids: [1, 2, 3],
+        articleTrap: true,
+        offsets: { 2: 1000 },
+    })
+    await env.dispatch(env.itemMod.focusArticleList(2))
+    await settle()
+    // The trap is still mounted: focusing now would be pulled back into it.
+    assert.deepEqual(env.focusedIds, [])
+    env.articleTrap = false
+    env.flushRaf()
+    await settle()
+    assert.deepEqual(env.focusedIds, [2])
+    assert.equal(env.container.scrollTop, 500)
+})
+
+test("a gives up after the trap never lifts", async () => {
+    const env = makeHarness({ iids: [1, 2], articleTrap: true })
+    const realNow = Date.now
+    let clock = realNow()
+    Date.now = () => clock
+    try {
+        await env.dispatch(env.itemMod.focusArticleList(1))
+        await settle()
+        for (let i = 0; i < 5; i += 1) {
+            clock += 100
+            env.flushRaf()
+            await settle()
+        }
+        assert.deepEqual(
+            env.focusedIds,
+            [],
+            "a trap that never unmounts must not steal focus from the article"
+        )
+    } finally {
+        Date.now = realNow
+    }
+    // The row is still reachable once the trap finally goes away.
+    env.articleTrap = false
+    await env.dispatch(env.itemMod.focusArticleList(1))
+    env.flushRaf()
+    await settle()
+    assert.equal(env.document.activeElement.id, 1)
+})
+
+test("a keeps the row focus is already on and only reveals it", async () => {
+    const env = makeHarness({ iids: [1, 2, 3], offsets: { 2: 2000 } })
+    env.document.activeElement = env.cards.get(2)
+    await env.dispatch(env.itemMod.focusArticleList(1))
+    assert.equal(env.document.activeElement.id, 2)
+    assert.equal(env.container.scrollTop, 1500, "row 2 is revealed in place")
+    assert.deepEqual(env.focusedIds, [], "no focus() on the row already focused")
+})
+
+test("a does nothing when the list has no rows", async () => {
+    const env = makeHarness({ iids: [] })
+    await env.dispatch(env.itemMod.focusArticleList(1))
+    await settle()
+    env.flushRaf()
+    await settle()
+    assert.deepEqual(env.focusedIds, [])
+    assert.equal(env.container.scrollTop, 0)
 })
 ;(async () => {
     for (const [name, fn] of tests) {

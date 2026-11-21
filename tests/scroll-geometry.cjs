@@ -49,6 +49,49 @@ const BASE = {
     maxScrollTop: 5000,
 }
 
+test("reveal leaves an already visible row and the scroll position alone", () => {
+    const kb = load("src/scripts/keyboard.ts")
+    assert.equal(
+        kb.computeRevealScrollTop(200, 100, 0, 600, 0, 5000),
+        0,
+        "row fully visible: no scroll"
+    )
+    assert.equal(
+        kb.computeRevealScrollTop(800, 100, 600, 600, 0, 5000),
+        600,
+        "row visible below a scrolled viewport: no scroll"
+    )
+})
+
+test("reveal scrolls the minimum distance to a row above the viewport", () => {
+    const kb = load("src/scripts/keyboard.ts")
+    // Row top is 600px above the viewport; its top lands on the visible top.
+    assert.equal(kb.computeRevealScrollTop(100, 100, 700, 600, 0, 5000), 100)
+    // A real top inset (overlay header) keeps the row clear of it.
+    assert.equal(kb.computeRevealScrollTop(100, 100, 700, 600, 32, 5000), 68)
+})
+
+test("reveal scrolls the minimum distance to a row below the viewport", () => {
+    const kb = load("src/scripts/keyboard.ts")
+    // Row bottom is 100px below the viewport bottom.
+    assert.equal(kb.computeRevealScrollTop(650, 100, 0, 600, 0, 5000), 150)
+    assert.equal(kb.computeRevealScrollTop(1000, 100, 0, 600, 0, 5000), 500)
+})
+
+test("reveal clamps to the scrollable range at both ends", () => {
+    const kb = load("src/scripts/keyboard.ts")
+    assert.equal(
+        kb.computeRevealScrollTop(9000, 100, 0, 600, 0, 500),
+        500,
+        "cannot scroll past the deepest offset"
+    )
+    assert.equal(
+        kb.computeRevealScrollTop(10, 20, 0, 600, 32, 5000),
+        0,
+        "a row above the inset at scrollTop 0 clamps to zero"
+    )
+})
+
 test("visible top inset is zero when the container starts below the nav", () => {
     const kb = load("src/scripts/keyboard.ts")
     assert.equal(kb.measureVisibleTopInset(32, 32, 600), 0)
