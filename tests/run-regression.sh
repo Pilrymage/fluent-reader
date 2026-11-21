@@ -17,6 +17,8 @@ tests=(
   fever-network
   web-article-frame
   static-cache-policy
+  server-auto-read
+  server-filter-rules
 )
 failed=()
 for t in "${tests[@]}"; do

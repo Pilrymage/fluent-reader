@@ -117,6 +117,26 @@ export function openDb(file: string, migrationsDir: string): DatabaseSync {
             fetched_at INTEGER NOT NULL
         )`
     )
+    // Server-owned filter rules (whole-feed auto-read, keyword auto-read).
+    // Same rationale as source_icons: rules change at runtime, a drizzle
+    // migration would only add deployment friction. The future learning
+    // system writes its decisions into this same table.
+    db.exec(
+        `CREATE TABLE IF NOT EXISTS filter_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT '*',
+            sids TEXT,
+            field TEXT NOT NULL DEFAULT 'title',
+            mode TEXT NOT NULL DEFAULT 'substr',
+            pattern TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL DEFAULT 'read',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            hits INTEGER NOT NULL DEFAULT 0,
+            note TEXT,
+            created_at INTEGER NOT NULL
+        )`
+    )
     return db
 }
 
@@ -431,6 +451,104 @@ export function markSourceRead(sid: number, before?: number) {
             sid,
             before
         )
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * Filter rules: whole-feed and keyword auto-read rules, server-owned
+ * like source_icons. The learning system that is planned on top of
+ * this writes rules through the same helpers.
+ * ------------------------------------------------------------------ */
+
+export interface FilterRuleRow {
+    id: number
+    kind: string
+    scope: string
+    sids: string | null
+    field: string
+    mode: string
+    pattern: string
+    action: string
+    enabled: number
+    hits: number
+    note: string | null
+    created_at: number
+}
+
+export function listFilterRules(): FilterRuleRow[] {
+    return all<FilterRuleRow>("SELECT * FROM filter_rules ORDER BY id")
+}
+
+export function getFilterRule(id: number): FilterRuleRow | undefined {
+    return get<FilterRuleRow>("SELECT * FROM filter_rules WHERE id = ?", id)
+}
+
+export function insertFilterRule(
+    rule: Omit<FilterRuleRow, "id" | "hits" | "created_at">
+): FilterRuleRow {
+    run(
+        `INSERT INTO filter_rules
+            (kind, scope, sids, field, mode, pattern, action, enabled, note, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        rule.kind,
+        rule.scope,
+        rule.sids,
+        rule.field,
+        rule.mode,
+        rule.pattern,
+        rule.action,
+        rule.enabled,
+        rule.note,
+        Date.now()
+    )
+    const row = get<FilterRuleRow>(
+        "SELECT * FROM filter_rules WHERE id = last_insert_rowid()"
+    )
+    if (!row) throw new Error("insertFilterRule produced no row")
+    return row
+}
+
+// Patchable columns, fixed by whitelist: column names never come from the
+// request body, so building the SET list dynamically is injection-safe.
+const RULE_PATCH_COLUMNS: Record<string, string> = {
+    scope: "scope",
+    sids: "sids",
+    field: "field",
+    mode: "mode",
+    pattern: "pattern",
+    action: "action",
+    enabled: "enabled",
+    note: "note",
+}
+
+export function updateFilterRule(
+    id: number,
+    patch: Partial<FilterRuleRow>
+): FilterRuleRow | null {
+    const entries = Object.entries(patch).filter(
+        ([key, value]) => key in RULE_PATCH_COLUMNS && value !== undefined
+    )
+    if (entries.length > 0) {
+        const sets = entries
+            .map(([key]) => `${RULE_PATCH_COLUMNS[key]} = ?`)
+            .join(", ")
+        run(
+            `UPDATE filter_rules SET ${sets} WHERE id = ?`,
+            ...entries.map(([, value]) => value),
+            id
+        )
+    }
+    return getFilterRule(id) ?? null
+}
+
+export function deleteFilterRule(id: number): boolean {
+    const result = run("DELETE FROM filter_rules WHERE id = ?", id)
+    return Number(result.changes) > 0
+}
+
+export function addRuleHits(hits: Map<number, number>): void {
+    for (const [id, count] of hits) {
+        run("UPDATE filter_rules SET hits = hits + ? WHERE id = ?", count, id)
     }
 }
 

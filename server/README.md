@@ -155,6 +155,43 @@ Miniflux 分类名，如 `外文`），BFF 在**每次刷新后、每次启动�
 - 2026-11-21 起 arm-main 的 `reader.env` 配置为 `READER_AUTO_READ_GROUPS=外文`
   （中文 19 源、翻译 120 源保持原样）。
 
+### 规则表：整源 / 关键词自动标读（filter_rules）
+
+分类标读是 env 级粗过滤；更细的过滤存 SQLite `filter_rules` 表（BFF 启动时自动建表），
+**增删改即时生效**（下一轮刷新就用新规则，无需重启）。每条规则命中即把条目标为已读
+（写回 Miniflux），并累计 `hits` 便于观察哪条规则在干活。将来"学习系统"对齐口味时，
+直接往同一张表写规则即可。
+
+规则字段：`kind`（`feed`=整源 / `keyword`=关键词）、`scope`（Miniflux 分类名或
+`*`）、`sids`（feed 类型的源 id 列表）、`field`（`title`/`creator`/`title_creator`）、
+`mode`（`substr` 大小写不敏感子串 / `regex` 大小写不敏感正则）、`pattern`、`enabled`、
+`note`。整组标读分类内的源不会再走规则（整组已全覆盖）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/filter/rules` | 全部规则 + `hits` |
+| POST | `/api/filter/rules` | 新建，`{kind, scope, sids?, field, mode, pattern, note?}` |
+| POST | `/api/filter/rules/:id` | 修改（`enabled`、`pattern` 等，校验合并结果） |
+| DELETE | `/api/filter/rules/:id` | 删除 |
+| POST | `/api/filter/preview` | **试运行**：按同样语义扫当前未读，返回命中标题样例，不标读 |
+
+```powershell
+# 例：不看电影资源帖（分类无关，全局）
+$h = @{ authorization = "Bearer $READER_TOKEN"; "content-type" = "application/json" }
+Invoke-RestMethod -Headers $h -Method Post http://127.0.0.1:7788/api/filter/rules -Body (@{
+    kind = "keyword"; scope = "*"; field = "title"; mode = "regex";
+    pattern = "(4K|1080P|韩剧|日剧|美剧|国语中字|已完结)"
+} | ConvertTo-Json)
+# 先看会命中什么，再决定要不要建规则：
+Invoke-RestMethod -Headers $h -Method Post http://127.0.0.1:7788/api/filter/preview -Body (@{
+    kind = "keyword"; scope = "中文"; field = "title"; mode = "substr"; pattern = "特朗普"
+} | ConvertTo-Json)
+```
+
+注意：`preview` 只扫未读、上限约 800 条，返回 `{scanned, matched, samples[]}`；
+关键词匹配的是**到达时**的未读——规则建好后，存量未读会在下一轮刷新（≤30 分钟，
+或手动 `POST /api/refresh`）被清掉。
+
 ## 部署到 arm-main（2026-11-15 已落地）
 
 | 项 | 值 |

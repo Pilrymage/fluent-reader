@@ -3,6 +3,14 @@ import fs from "node:fs"
 import path from "node:path"
 import { createHash, timingSafeEqual } from "node:crypto"
 import { upsertSource } from "./db.ts"
+import {
+    deleteFilterRule,
+    getFilterRule,
+    insertFilterRule,
+    listFilterRules,
+    updateFilterRule,
+} from "./db.ts"
+import type { FilterRuleRow } from "./db.ts"
 import type { ReaderBackend } from "./backend.ts"
 import type { ServerConfig } from "./config.ts"
 
@@ -59,6 +67,95 @@ async function readJson(req: http.IncomingMessage): Promise<any> {
         return JSON.parse(Buffer.concat(chunks).toString("utf8"))
     } catch {
         throw new Error("Invalid JSON body")
+    }
+}
+
+function normalizeRule(row: FilterRuleRow) {
+    return {
+        id: row.id,
+        kind: row.kind,
+        scope: row.scope,
+        sids: row.sids,
+        field: row.field,
+        mode: row.mode,
+        pattern: row.pattern,
+        action: row.action,
+        enabled: Boolean(row.enabled),
+        hits: row.hits,
+        note: row.note,
+        createdAt: row.created_at,
+    }
+}
+
+// Turn a request body into a full rule row. Shared by POST /rules and
+// POST /rules/:id — the patch path validates the merged result, so an update
+// cannot leave a rule that would not have been creatable.
+function parseRuleBody(
+    body: any,
+    existing?: FilterRuleRow
+): { error?: string; value?: FilterRuleRow } {
+    const kind = existing ? existing.kind : body.kind
+    if (kind !== "feed" && kind !== "keyword")
+        return { error: "kind must be feed or keyword" }
+    const scope =
+        typeof body.scope === "string" && body.scope.trim()
+            ? body.scope.trim()
+            : existing?.scope ?? "*"
+    const field = typeof body.field === "string" ? body.field : existing?.field
+    if (field && !["title", "creator", "title_creator"].includes(field))
+        return { error: "field must be title, creator or title_creator" }
+    const mode = typeof body.mode === "string" ? body.mode : existing?.mode
+    if (mode && mode !== "substr" && mode !== "regex")
+        return { error: "mode must be substr or regex" }
+    const pattern =
+        typeof body.pattern === "string" ? body.pattern : existing?.pattern
+    if (kind === "keyword") {
+        if (!pattern || !pattern.trim()) return { error: "pattern is required" }
+        if (mode === "regex") {
+            try {
+                new RegExp(pattern, "i")
+            } catch (err) {
+                return {
+                    error: `regex does not compile: ${
+                        err instanceof Error ? err.message : err
+                    }`,
+                }
+            }
+        }
+    }
+    const sids =
+        kind === "feed"
+            ? Array.isArray(body.sids)
+                ? body.sids.map(Number).filter(Number.isFinite).join(",")
+                : existing?.sids ?? ""
+            : null
+    if (kind === "feed" && !sids)
+        return { error: "sids is required for kind=feed" }
+    const enabled =
+        body.enabled === undefined
+            ? existing?.enabled ?? 1
+            : body.enabled
+            ? 1
+            : 0
+    const note =
+        typeof body.note === "string" && body.note.trim()
+            ? body.note.trim().slice(0, 200)
+            : existing?.note ?? null
+    return {
+        value: {
+            id: existing?.id ?? 0,
+            kind,
+            scope,
+            sids,
+            field: field ?? "title",
+            mode: mode ?? "substr",
+            pattern: pattern ?? "",
+            action: "read",
+            enabled,
+            hits: existing?.hits ?? 0,
+            note,
+            created_at: existing?.created_at ?? 0,
+        },
     }
 }
 
@@ -211,6 +308,73 @@ export function createApiServer(config: ServerConfig, backend: ReaderBackend) {
             if (readAll && req.method === "POST") {
                 await backend.markSourcesRead([Number(readAll[1])])
                 json(res, 200, { ok: true })
+                return
+            }
+
+            /* ----------------- filter rules ----------------- */
+
+            if (url.pathname === "/api/filter/rules" && req.method === "GET") {
+                json(res, 200, {
+                    rules: listFilterRules().map(normalizeRule),
+                })
+                return
+            }
+
+            if (url.pathname === "/api/filter/rules" && req.method === "POST") {
+                const parsed = parseRuleBody(await readJson(req))
+                if (parsed.error || !parsed.value) {
+                    json(res, 400, { error: parsed.error })
+                    return
+                }
+                const row = insertFilterRule(parsed.value)
+                json(res, 200, { rule: normalizeRule(row) })
+                return
+            }
+
+            const ruleMatch = /^\/api\/filter\/rules\/(\d+)$/.exec(url.pathname)
+            if (
+                ruleMatch &&
+                (req.method === "POST" || req.method === "DELETE")
+            ) {
+                const id = Number(ruleMatch[1])
+                const existing = getFilterRule(id)
+                if (!existing) {
+                    json(res, 404, { error: "no such rule" })
+                    return
+                }
+                if (req.method === "DELETE") {
+                    if (!deleteFilterRule(id)) {
+                        json(res, 500, { error: "delete failed" })
+                        return
+                    }
+                    json(res, 200, { ok: true })
+                    return
+                }
+                const parsed = parseRuleBody(await readJson(req), existing)
+                if (parsed.error || !parsed.value) {
+                    json(res, 400, { error: parsed.error })
+                    return
+                }
+                const row = updateFilterRule(id, parsed.value)
+                json(res, 200, { rule: normalizeRule(row ?? existing) })
+                return
+            }
+
+            if (
+                url.pathname === "/api/filter/preview" &&
+                req.method === "POST"
+            ) {
+                const parsed = parseRuleBody(await readJson(req))
+                if (parsed.error || !parsed.value) {
+                    json(res, 400, { error: parsed.error })
+                    return
+                }
+                if (!backend.previewRule) {
+                    json(res, 501, { error: "backend has no categories" })
+                    return
+                }
+                const result = await backend.previewRule(parsed.value)
+                json(res, 200, result)
                 return
             }
 

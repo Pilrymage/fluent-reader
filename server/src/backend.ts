@@ -1,8 +1,10 @@
 import type { ServerConfig } from "./config.ts"
 import {
+    addRuleHits,
     countItems,
     countUnread,
     getItem,
+    listFilterRules,
     listItems,
     listSources,
     markSourceRead,
@@ -10,7 +12,7 @@ import {
     sourcesWithUnread,
     upsertEntries,
 } from "./db.ts"
-import type { SourceRow } from "./db.ts"
+import type { FilterRuleRow, SourceRow } from "./db.ts"
 import { firstImage, textOf } from "./html.ts"
 import {
     discoverIcon,
@@ -86,6 +88,17 @@ export interface ReaderBackend {
      *  unread entry of the listed categories read. Absent on backends that
      *  have no categories. */
     autoRead?(): Promise<{ groups: number; entries: number }>
+    /** Dry-run one candidate rule against current unread entries: report the
+     *  matches without marking anything. Absent on backends without
+     *  categories. */
+    previewRule?(
+        rule: FilterRuleRow,
+        maxEntries?: number
+    ): Promise<{
+        scanned: number
+        matched: number
+        samples: { feed: string; title: string }[]
+    }>
     stats(): Promise<{
         items: number
         unread: number
@@ -107,6 +120,69 @@ const UNREAD_PAGE_SIZE = 100
  *  continues where this one stopped. 200 pages × 100 entries is far past any
  *  real backlog. */
 const MAX_SWEEP_PAGES = 200
+
+/** Max unread entries a rule preview walks before reporting back. */
+const PREVIEW_ENTRY_CAP = 800
+/** Matched titles a preview reports; the rest is a count. */
+const PREVIEW_SAMPLE_CAP = 50
+
+function ruleFieldText(entry: MinifluxEntry, field: string): string {
+    const title = entry.title ?? ""
+    const author = entry.author ?? ""
+    if (field === "creator") return author
+    if (field === "title_creator") return `${title}\n${author}`
+    return title
+}
+
+type CompiledRule = {
+    rule: FilterRuleRow
+    test: (entry: MinifluxEntry) => boolean
+}
+
+/**
+ * Compile one filter rule into a predicate over Miniflux entries.
+ *
+ *  - kind "feed": matches the listed feed ids (sids, comma-separated).
+ *  - kind "keyword": substring (case-insensitive) or regex (case-insensitive)
+ *    over title / creator / both, in the configured scope (Miniflux category
+ *    title, or "*" for every category).
+ *
+ * A rule that cannot compile (bad regex, empty sids, empty pattern) returns
+ * null and is skipped instead of failing the sweep; the API layer rejects
+ * those at creation time, this is the defensive second line.
+ */
+function compileRule(rule: FilterRuleRow): CompiledRule | null {
+    if (rule.kind === "feed") {
+        const sids = new Set(
+            (rule.sids ?? "")
+                .split(",")
+                .map(part => Number(part.trim()))
+                .filter(Number.isFinite)
+        )
+        if (sids.size === 0) return null
+        return { rule, test: entry => sids.has(entry.feed_id) }
+    }
+    const pattern = rule.pattern ?? ""
+    if (!pattern) return null
+    if (rule.mode === "regex") {
+        let regex: RegExp
+        try {
+            regex = new RegExp(pattern, "i")
+        } catch {
+            return null
+        }
+        return {
+            rule,
+            test: entry => regex.test(ruleFieldText(entry, rule.field)),
+        }
+    }
+    const needle = pattern.toLowerCase()
+    return {
+        rule,
+        test: entry =>
+            ruleFieldText(entry, rule.field).toLowerCase().includes(needle),
+    }
+}
 
 /* ------------------------------------------------------------------ *
  * Miniflux backend: Miniflux stays the only fetcher and store. This
@@ -329,10 +405,15 @@ function createMinifluxBackend(config: ServerConfig): ReaderBackend {
         return marked
     }
 
-    /** Mark every unread entry of these feeds read. Feeds drain in a small
-     *  worker pool; one feed failing does not stop the others. Returns how
-     *  many entries were marked. */
-    async function markFeedsRead(sids: number[]): Promise<number> {
+    /** Mark unread entries of these feeds read. With `keep`, only entries the
+     *  predicate accepts are marked (the filter rules); without it the whole
+     *  feed is drained. Feeds run in a small worker pool; one feed failing
+     *  does not stop the others. Returns how many entries were marked. */
+    async function markFeedsRead(
+        sids: number[],
+        keep?: (entry: MinifluxEntry) => boolean
+    ): Promise<number> {
+        const test = keep ?? (() => true)
         const queue = [...sids]
         let marked = 0
         const runners = Array.from(
@@ -342,7 +423,13 @@ function createMinifluxBackend(config: ServerConfig): ReaderBackend {
                     const sid = queue.shift()
                     if (sid === undefined) break
                     try {
-                        marked += await drainFeedUnread(sid)
+                        // Compound assignment reads the target BEFORE the
+                        // await resolves, so `marked += await drain()` loses
+                        // updates when the worker pool drains feeds
+                        // concurrently. Decoupling the await from the read is
+                        // the fix; keep it this way.
+                        const drained = await drainFeedUnread(sid, test)
+                        marked += drained
                         markSourceRead(sid)
                     } catch (err) {
                         console.error(
@@ -478,29 +565,142 @@ function createMinifluxBackend(config: ServerConfig): ReaderBackend {
             }
         },
         /**
-         * The category auto-read filter (READER_AUTO_READ_GROUPS): after every
-         * refresh, every unread entry of the listed categories is marked read
-         * in Miniflux, so those articles never surface as unread on any
-         * client. Categories are matched by title each sweep, so feeds moved
-         * into a listed category start filtering automatically.
+         * The category auto-read filter (READER_AUTO_READ_GROUPS) plus the
+         * filter_rules table: after every refresh,
+         *  - every unread entry of a listed category is marked read, and
+         *  - unread entries matching an enabled rule (whole feed, or keyword
+         *    on title/creator) are marked read, with per-rule hit counts.
+         * All marks are written to Miniflux, so they apply to every client.
+         * A category with neither whole-read nor any applicable rule is not
+         * scanned. Inside a whole-read category the rules are moot, so its
+         * feeds are drained unconditionally and hits are not counted there.
          */
         async autoRead() {
-            const names = config.autoReadGroups
-            if (names.length === 0) return { groups: 0, entries: 0 }
+            const autoNames = config.autoReadGroups
+            const rules = listFilterRules()
+                .filter(rule => rule.enabled)
+                .map(compileRule)
+                .filter(
+                    (compiled): compiled is CompiledRule => compiled !== null
+                )
+            if (autoNames.length === 0 && rules.length === 0)
+                return { groups: 0, entries: 0 }
             const groups = await backend.groups()
-            const targets = groups.filter(group => names.includes(group.name))
-            let entries = 0
-            for (const group of targets) {
-                entries += await markFeedsRead(group.sids)
+            let wholeEntries = 0
+            let ruleEntries = 0
+            let swept = 0
+            const wholeGroups: string[] = []
+            const hits = new Map<number, number>()
+            for (const group of groups) {
+                const whole = autoNames.includes(group.name)
+                const applicable = rules.filter(
+                    compiled =>
+                        compiled.rule.scope === "*" ||
+                        compiled.rule.scope === group.name
+                )
+                if (!whole && applicable.length === 0) continue
+                swept += 1
+                const keep = whole
+                    ? undefined
+                    : entry => {
+                          let matched = false
+                          for (const compiled of applicable) {
+                              if (compiled.test(entry)) {
+                                  matched = true
+                                  hits.set(
+                                      compiled.rule.id,
+                                      (hits.get(compiled.rule.id) ?? 0) + 1
+                                  )
+                              }
+                          }
+                          return matched
+                      }
+                const marked = await markFeedsRead(group.sids, keep)
+                if (whole) {
+                    wholeEntries += marked
+                    if (marked > 0) wholeGroups.push(group.name)
+                } else {
+                    ruleEntries += marked
+                }
             }
-            if (targets.length > 0 && entries > 0) {
+            if (hits.size > 0) {
+                addRuleHits(hits)
+                const summary = [...hits.entries()]
+                    .map(([id, count]) => `#${id}:${count}`)
+                    .join(", ")
+                console.log(`[auto-read] rule hits: ${summary}`)
+            }
+            const entries = wholeEntries + ruleEntries
+            if (entries > 0) {
                 console.log(
-                    `[auto-read] ${targets
-                        .map(group => group.name)
-                        .join(", ")}: ${entries} unread marked read`
+                    `[auto-read] marked ${entries} unread (whole: ${wholeEntries}${
+                        wholeGroups.length > 0
+                            ? ` [${wholeGroups.join(", ")}]`
+                            : ""
+                    }, rules: ${ruleEntries})`
                 )
             }
-            return { groups: targets.length, entries }
+            return { groups: swept, entries }
+        },
+        /**
+         * Dry-run one candidate rule against the current unread entries of
+         * its scope: counts matches and returns a sample of titles. Marks
+         * nothing, writes nothing.
+         */
+        async previewRule(rule, maxEntries = PREVIEW_ENTRY_CAP) {
+            const compiled = compileRule(rule)
+            if (!compiled) throw new Error("rule does not compile")
+            const groups = await backend.groups()
+            const feedsById = new Map(
+                (await feeds()).map(feed => [feed.id, feed.title])
+            )
+            const sids =
+                rule.kind === "feed"
+                    ? [...(rule.sids ?? "").split(",")]
+                          .map(part => Number(part.trim()))
+                          .filter(Number.isFinite)
+                    : groups
+                          .filter(
+                              group =>
+                                  rule.scope === "*" ||
+                                  rule.scope === group.name
+                          )
+                          .flatMap(group => group.sids)
+            let scanned = 0
+            let matched = 0
+            const samples: { feed: string; title: string }[] = []
+            for (const sid of sids) {
+                for (
+                    let offset = 0;
+                    offset < maxEntries;
+                    offset += UNREAD_PAGE_SIZE
+                ) {
+                    const { entries } = await client.entries({
+                        feed_id: sid,
+                        status: "unread",
+                        limit: UNREAD_PAGE_SIZE,
+                        offset,
+                    })
+                    for (const entry of entries) {
+                        scanned += 1
+                        if (compiled.test(entry)) {
+                            matched += 1
+                            if (samples.length < PREVIEW_SAMPLE_CAP) {
+                                samples.push({
+                                    feed:
+                                        feedsById.get(entry.feed_id) ??
+                                        String(entry.feed_id),
+                                    title: entry.title ?? "",
+                                })
+                            }
+                        }
+                    }
+                    if (entries.length < UNREAD_PAGE_SIZE) break
+                    if (scanned >= maxEntries) break
+                }
+                if (scanned >= maxEntries) break
+            }
+            return { scanned, matched, samples }
         },
         async stats() {
             const counters = await client.counters()
